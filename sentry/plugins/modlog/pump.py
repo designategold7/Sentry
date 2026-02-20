@@ -62,4 +62,4 @@ class ModLogPump(LoggingClass):
     def send(self, payload):
         with self._lock:
             self._buffer.append(payload)
-            self._have.set()
+            self._have.set()    
