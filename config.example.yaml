@@ -1,0 +1,20 @@
+token: ''
+manhole_enable: true
+manhole_bind: 127.0.0.1:7171
+state:
+  sync_guild_members: false
+bot:
+  commands_enabled: false
+  plugins:
+    - sentry.plugins.core
+    - sentry.plugins.modlog
+    - sentry.plugins.admin
+    - sentry.plugins.infractions
+    - sentry.plugins.spam
+    - sentry.plugins.censor
+    - sentry.plugins.reddit
+    - sentry.plugins.starboard
+    - sentry.plugins.utilities
+    - sentry.plugins.sql
+    - sentry.plugins.internal
+    - sentry.plugins.stats
