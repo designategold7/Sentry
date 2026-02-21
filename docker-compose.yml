@@ -1,0 +1,59 @@
+version: '2'
+services:
+  db:
+    build: ./docker/database/
+    volumes:
+      - ./.data:/var/lib/postgresql/data
+  redis:
+    image: redis:3.2
+    command: redis-server --appendonly yes
+    volumes:
+      - ./.data:/data
+    ports:
+      - "6379:6379"
+  statsd:
+    image: python:3.12
+    volumes:
+      - .:/opt/sentry
+    command: python /opt/sentry/docker/nulld.py
+    ports:
+      - "8125:8125"
+    stop_signal: SIGKILL
+  web:
+    build: .
+    command: python manage.py serve -r
+    volumes:
+      - .:/opt/sentry
+    ports:
+      - "8686:8686"
+    depends_on:
+      - db
+      - redis
+      - statsd
+  frontend:
+    build: ./frontend/
+    environment:
+      - NODE_ENV=docker
+    command: npm run serve
+    volumes:
+      - ./frontend:/opt/frontend
+    ports:
+      - "8080:8080"
+    depends_on:
+      - web
+  bot:
+    build: .
+    command: python manage.py bot -e docker
+    volumes:
+      - .:/opt/sentry
+    ports:
+      - "7171:7171"
+    depends_on:
+      - web
+  workers:
+    build: .
+    command: python manage.py workers
+    volumes:
+      - .:/opt/sentry
+    depends_on:
+      - web
