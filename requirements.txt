@@ -43,3 +43,13 @@ tinycss2>=1.2.1
 webencodings>=0.5.1
 Werkzeug>=3.0.1
 peewee>=3.17.0
+flask
+gevent
+peewee
+psycopg2-binary
+psycogreen
+click
+werkzeug
+holster
+websocket-client
+datadog
