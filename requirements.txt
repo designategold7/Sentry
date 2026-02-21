@@ -55,3 +55,4 @@ websocket-client
 datadog
 fuzzywuzzy
 python-Levenshtein
+pygal
