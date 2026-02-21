@@ -1,5 +1,11 @@
 #!/usr/bin/env python
 from gevent import monkey; monkey.patch_all()
+import flask
+if not hasattr(flask.Flask, 'before_first_request'):
+    def before_first_request(self, f):
+        self.before_request(f)
+        return f
+    flask.Flask.before_first_request = before_first_request
 import os
 import copy
 import click
@@ -53,7 +59,7 @@ def bot(env):
     BotSupervisor(env={'ENV': env}).run_forever()
 @cli.command()
 def workers():
-    from sentry.tasks.worker import TaskWorker
+    from sentry.tasks import TaskWorker
     logging.getLogger('peewee').setLevel(logging.INFO)
     init_db(ENV)
     TaskWorker().run()
