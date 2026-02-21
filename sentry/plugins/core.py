@@ -24,20 +24,12 @@ from sentry.redis import rdb
 import sentry.models
 from peewee import ModelInsert
 def patched_upsert(self, *args, **kwargs):
-    self._is_upsert = True
     target = kwargs.get('target') or (args[0] if args else None)
     if target:
         if isinstance(target, str): target = [target]
-        return self.on_conflict(conflict_target=target, action='NOTHING')
-    return self.on_conflict(action='NOTHING')
+        return self.on_conflict(conflict_target=target, preserve=target)
+    return self.on_conflict_ignore()
 ModelInsert.upsert = patched_upsert
-original_execute = ModelInsert.execute
-def patched_execute(self, *args, **kwargs):
-    result = original_execute(self, *args, **kwargs)
-    if not result and getattr(self, '_is_upsert', False):
-        return [None]
-    return result
-ModelInsert.execute = patched_execute
 from sentry.models.guild import Guild, GuildBan
 from sentry.models.message import Command
 from sentry.models.notification import Notification
