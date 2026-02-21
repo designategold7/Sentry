@@ -3,10 +3,11 @@ import time
 import gevent
 import humanize
 import operator
+import functools
 from peewee import fn
 from holster.emitter import Priority
 from fuzzywuzzy import fuzz
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from disco.bot import CommandLevels
 from disco.types.user import User as DiscoUser
 from disco.types.message import MessageTable, MessageEmbed, MessageEmbedField, MessageEmbedThumbnail
@@ -27,7 +28,9 @@ from sentry.models.message import Message, Reaction, MessageArchive
 from sentry.constants import (
     GREEN_TICK_EMOJI_ID, RED_TICK_EMOJI_ID, GREEN_TICK_EMOJI, RED_TICK_EMOJI
 )
+
 EMOJI_RE = re.compile(r'<:[a-zA-Z0-9_]+:([0-9]+)>')
+
 CUSTOM_EMOJI_STATS_SERVER_SQL = """
 SELECT gm.emoji_id, gm.name, count(*) FROM guild_emojis gm
 JOIN messages m ON m.emojis @> ARRAY[gm.emoji_id]
@@ -36,6 +39,7 @@ GROUP BY 1, 2
 ORDER BY 3 {}
 LIMIT 30
 """
+
 CUSTOM_EMOJI_STATS_GLOBAL_SQL = """
 SELECT gm.emoji_id, gm.name, count(*) FROM guild_emojis gm
 JOIN messages m ON m.emojis @> ARRAY[gm.emoji_id]
@@ -44,11 +48,13 @@ GROUP BY 1, 2
 ORDER BY 3 {}
 LIMIT 30
 """
+
 class PersistConfig(SlottedModel):
     roles = Field(bool, default=False)
     nickname = Field(bool, default=False)
     voice = Field(bool, default=False)
     role_ids = ListField(snowflake, default=[])
+
 class AdminConfig(PluginConfig):
     confirm_actions = Field(bool, default=True)
     persist = Field(PersistConfig, default=None)
@@ -56,6 +62,7 @@ class AdminConfig(PluginConfig):
     group_roles = DictField(lambda value: str(value).lower(), snowflake)
     group_confirm_reactions = Field(bool, default=False)
     locked_roles = ListField(snowflake)
+
 @Plugin.with_config(AdminConfig)
 class AdminPlugin(Plugin):
     def load(self, ctx):
@@ -63,11 +70,13 @@ class AdminPlugin(Plugin):
         self.cleans = {}
         self.unlocked_roles = {}
         self.role_debounces = {}
+
     def restore_user(self, event, member):
         try:
             backup = GuildMemberBackup.get(guild_id=event.guild_id, user_id=member.user.id)
         except GuildMemberBackup.DoesNotExist:
             return
+
         kwargs = {}
         if event.config.persist.roles:
             roles = set(event.guild.roles.keys())
@@ -76,13 +85,17 @@ class AdminPlugin(Plugin):
             roles = set(backup.roles) & roles
             if roles:
                 kwargs['roles'] = list(roles)
+
         if event.config.persist.nickname and backup.nick is not None:
             kwargs['nick'] = backup.nick
+
         if event.config.persist.voice and (backup.mute or backup.deaf):
             kwargs['mute'] = backup.mute
             kwargs['deaf'] = backup.deaf
+
         if not kwargs:
             return
+
         self.call(
             'ModLogPlugin.create_debounce',
             event,
@@ -95,35 +108,44 @@ class AdminPlugin(Plugin):
             event.guild.id,
             member=member,
         )
+
     @Plugin.listen('GuildMemberRemove', priority=Priority.BEFORE)
     def on_guild_member_remove(self, event):
         if event.user.id in event.guild.members:
             GuildMemberBackup.create_from_member(event.guild.members.get(event.user.id))
+
     @Plugin.listen('GuildMemberAdd')
     def on_guild_member_add(self, event):
         if not event.config.persist:
             return
         self.restore_user(event, event.member)
+
     @Plugin.listen('GuildRoleUpdate', priority=Priority.BEFORE)
     def on_guild_role_update(self, event):
         if event.role.id not in event.config.locked_roles:
             return
+
         if event.role.id in self.unlocked_roles and self.unlocked_roles[event.role.id] > time.time():
             return
+
         if event.role.id in self.role_debounces:
             if self.role_debounces.pop(event.role.id) > time.time():
                 return
+
         role_before = event.guild.roles.get(event.role.id)
         if not role_before:
             return
+
         to_update = {}
         for field in ('name', 'hoist', 'color', 'permissions', 'position'):
             if getattr(role_before, field) != getattr(event.role, field):
                 to_update[field] = getattr(role_before, field)
+
         if to_update:
             self.log.warning('Rolling back update to roll %s (in %s), roll is locked', event.role.id, event.guild_id)
             self.role_debounces[event.role.id] = time.time() + 60
             event.role.update(**to_update)
+
     @Plugin.command('roles', level=CommandLevels.MOD)
     def roles(self, event):
         buff = ''
@@ -134,6 +156,7 @@ class AdminPlugin(Plugin):
                 buff = ''
             buff += role
         return event.msg.reply('```{}```'.format(buff))
+
     @Plugin.command('restore', '<user:user>', level=CommandLevels.MOD, group='backups')
     def restore(self, event, user):
         member = event.guild.get_member(user)
@@ -141,27 +164,32 @@ class AdminPlugin(Plugin):
             self.restore_user(event, member)
         else:
             raise CommandFail('invalid user')
+
     @Plugin.command('clear', '<user_id:snowflake>', level=CommandLevels.MOD, group='backups')
     def backups_clear(self, event, user_id):
         deleted = bool(GuildMemberBackup.delete().where(
             (GuildMemberBackup.user_id == user_id) &
             (GuildMemberBackup.guild_id == event.guild.id)
         ).execute())
+
         if deleted:
             event.msg.reply(':ok_hand: I\'ve cleared the member backup for that user')
         else:
             raise CommandFail('I couldn\'t find any member backups for that user')
+
     def can_act_on(self, event, victim_id, throw=True):
         if event.author.id == victim_id:
             if not throw:
                 return False
             raise CommandFail('cannot execute that action on yourself')
+
         victim_level = self.bot.plugins.get('CorePlugin').get_level(event.guild, victim_id)
         if event.user_level <= victim_level:
             if not throw:
                 return False
             raise CommandFail('invalid permissions')
         return True
+
     @Plugin.command('here', '[size:int]', level=CommandLevels.MOD, context={'mode': 'all'}, group='archive')
     @Plugin.command('all', '[size:int]', level=CommandLevels.MOD, context={'mode': 'all'}, group='archive')
     @Plugin.command(
@@ -179,6 +207,7 @@ class AdminPlugin(Plugin):
     def archive(self, event, size=50, mode=None, user=None, channel=None):
         if 0 > size >= 15000:
             raise CommandFail('too many messages must be between 1-15000')
+
         q = Message.select(Message.id).join(User).order_by(Message.id.desc()).limit(size)
         if mode in ('all', 'channel'):
             q = q.where((Message.channel_id == (channel or event.channel).id))
@@ -187,51 +216,64 @@ class AdminPlugin(Plugin):
                 (Message.author_id == (user if isinstance(user, int) else user.id)) &
                 (Message.guild_id == event.guild.id)
             )
+
         archive = MessageArchive.create_from_message_ids([i.id for i in q])
         event.msg.reply('OK, archived {} messages at {}'.format(len(archive.message_ids), archive.url))
+
     @Plugin.command('extend', '<archive_id:str> <duration:str>', level=CommandLevels.MOD, group='archive')
     def archive_extend(self, event, archive_id, duration):
         try:
             archive = MessageArchive.get(archive_id=archive_id)
         except MessageArchive.DoesNotExist:
             raise CommandFail('invalid message archive id')
+
         archive.expires_at = parse_duration(duration)
         MessageArchive.update(
             expires_at=parse_duration(duration)
         ).where(
             (MessageArchive.archive_id == archive_id)
         ).execute()
+
         raise CommandSuccess('duration of archive {} has been extended (<{}>)'.format(
             archive_id,
             archive.url,
         ))
+
     @Plugin.command('clean cancel', level=CommandLevels.MOD)
     def clean_cacnel(self, event):
         if event.channel.id not in self.cleans:
             raise CommandFail('no clean is running in this channel')
+
         self.cleans[event.channel.id].kill()
         event.msg.reply('Ok, the running clean was cancelled')
+
     @Plugin.command('clean all', '[size:int]', level=CommandLevels.MOD, context={'mode': 'all'})
     @Plugin.command('clean bots', '[size:int]', level=CommandLevels.MOD, context={'mode': 'bots'})
     @Plugin.command('clean user', '<user:user> [size:int]', level=CommandLevels.MOD, context={'mode': 'user'})
     def clean(self, event, user=None, size=25, typ=None, mode='all'):
-        """
-        Removes messages
-        """
         if 0 > size >= 10000:
             raise CommandFail('too many messages must be between 1-10000')
+
         if event.channel.id in self.cleans:
             raise CommandFail('a clean is already running on this channel')
+
+        # Modernized datetime
+        now = datetime.now(timezone.utc).replace(tzinfo=None)
+
         query = Message.select(Message.id).where(
             (Message.deleted >> False) &
             (Message.channel_id == event.channel.id) &
-            (Message.timestamp > (datetime.utcnow() - timedelta(days=13)))
+            (Message.timestamp > (now - timedelta(days=13)))
         ).join(User).order_by(Message.timestamp.desc()).limit(size)
+
         if mode == 'bots':
             query = query.where((User.bot >> True))
         elif mode == 'user':
             query = query.where((User.user_id == user.id))
-        messages = [i[0] for i in query.tuples()]
+
+        # Reflection Pattern for async
+        messages = [i[0] for i in getattr(query.tuples(), 'async')()]
+
         if len(messages) > 100:
             msg = event.msg.reply('Woah there, that will delete a total of {} messages, please confirm.'.format(
                 len(messages)
@@ -239,6 +281,7 @@ class AdminPlugin(Plugin):
             msg.chain(False).\
                 add_reaction(GREEN_TICK_EMOJI).\
                 add_reaction(RED_TICK_EMOJI)
+
             try:
                 mra_event = self.wait_for_event(
                     'MessageReactionAdd',
@@ -251,15 +294,20 @@ class AdminPlugin(Plugin):
                 return
             finally:
                 msg.delete()
+
             if mra_event.emoji.id != GREEN_TICK_EMOJI_ID:
                 return
+
             event.msg.reply(':wastebasket: Ok please hold on while I delete those messages...').after(5).delete()
+
         def run_clean():
             for chunk in chunks(messages, 100):
                 self.client.api.channels_messages_delete_bulk(event.channel.id, chunk)
+
         self.cleans[event.channel.id] = gevent.spawn(run_clean)
         self.cleans[event.channel.id].join()
         del self.cleans[event.channel.id]
+
     @Plugin.command(
         'add',
         '<user:user> <role:str> [reason:str...]',
@@ -284,12 +332,10 @@ class AdminPlugin(Plugin):
         elif role.lower() in event.config.role_aliases:
             role_obj = event.guild.roles.get(event.config.role_aliases[role.lower()])
         else:
-            # First try exact match
             exact_matches = [i for i in event.guild.roles.values() if i.name.lower().replace(' ', '') == role.lower()]
             if len(exact_matches) == 1:
                 role_obj = exact_matches[0]
             else:
-                # Otherwise we fuzz it up
                 rated = sorted([
                     (fuzz.partial_ratio(role, r.name.replace(' ', '')), r) for r in event.guild.roles.values()
                 ], key=lambda i: i[0], reverse=True)
@@ -298,33 +344,42 @@ class AdminPlugin(Plugin):
                         role_obj = rated[0][1]
                     elif rated[0][0] - rated[1][0] > 20:
                         role_obj = rated[0][1]
+
         if not role_obj:
             raise CommandFail('too many matches for that role, try something more exact or the role ID')
+
         author_member = event.guild.get_member(event.author)
         highest_role = sorted(
             [event.guild.roles.get(r) for r in author_member.roles],
             key=lambda i: i.position,
             reverse=True)
+
         if not author_member.owner and (not highest_role or highest_role[0].position <= role_obj.position):
             raise CommandFail('you can only {} roles that are ranked lower than your highest role'.format(mode))
+
         member = event.guild.get_member(user)
         if not member:
             raise CommandFail('invalid member')
+
         self.can_act_on(event, member.id)
+
         if mode == 'add' and role_obj.id in member.roles:
             raise CommandFail('{} already has the {} role'.format(member, role_obj.name))
         elif mode == 'remove' and role_obj.id not in member.roles:
             return CommandFail('{} doesn\'t have the {} role'.format(member, role_obj.name))
+
         self.call(
             'ModLogPlugin.create_debounce',
             event,
             ['GuildMemberUpdate'],
             role_id=role_obj.id,
         )
+
         if mode == 'add':
             member.add_role(role_obj.id)
         else:
             member.remove_role(role_obj.id)
+
         self.call(
             'ModLogPlugin.log_action_ext',
             (Actions.MEMBER_ROLE_ADD if mode == 'add' else Actions.MEMBER_ROLE_REMOVE),
@@ -334,13 +389,14 @@ class AdminPlugin(Plugin):
             actor=str(event.author),
             reason=reason or 'no reason',
         )
+
         event.msg.reply(':ok_hand: {} role {} to {}'.format('added' if mode == 'add' else 'removed',
             role_obj.name,
             member))
+
     @Plugin.command('stats', '<user:user>', level=CommandLevels.MOD)
     def msgstats(self, event, user):
-        # Query for the basic aggregate message statistics
-        message_stats = Message.select(
+        message_stats_query = Message.select(
             fn.Count('*'),
             fn.Sum(fn.char_length(Message.content)),
             fn.Sum(fn.array_length(Message.emojis, 1)),
@@ -348,8 +404,11 @@ class AdminPlugin(Plugin):
             fn.Sum(fn.array_length(Message.attachments, 1)),
         ).where(
             (Message.author_id == user.id)
-        ).tuples().async()
-        reactions_given = Reaction.select(
+        ).tuples()
+        
+        message_stats = getattr(message_stats_query, 'async')()
+
+        reactions_given_query = Reaction.select(
             fn.Count('*'),
             Reaction.emoji_id,
             Reaction.emoji_name,
@@ -360,9 +419,11 @@ class AdminPlugin(Plugin):
             (Reaction.user_id == user.id)
         ).group_by(
             Reaction.emoji_id, Reaction.emoji_name
-        ).order_by(fn.Count('*').desc()).tuples().async()
-        # Query for most used emoji
-        emojis = Message.raw('''
+        ).order_by(fn.Count('*').desc()).tuples()
+        
+        reactions_given = getattr(reactions_given_query, 'async')()
+
+        emojis_query = Message.raw('''
             SELECT gm.emoji_id, gm.name, count(*)
             FROM (
                 SELECT unnest(emojis) as id
@@ -373,80 +434,97 @@ class AdminPlugin(Plugin):
             GROUP BY 1, 2
             ORDER BY 3 DESC
             LIMIT 1
-        ''', (user.id, )).tuples().async()
-        deleted = Message.select(
+        ''', (user.id, )).tuples()
+        
+        emojis = getattr(emojis_query, 'async')()
+
+        deleted_query = Message.select(
             fn.Count('*')
         ).where(
             (Message.author_id == user.id) &
             (Message.deleted == 1)
-        ).tuples().async()
+        ).tuples()
+        
+        deleted = getattr(deleted_query, 'async')()
+
         wait_many(message_stats, reactions_given, emojis, deleted, timeout=10)
-        # If we hit an exception executing the core query, throw an exception
+
         if message_stats.exception:
             message_stats.get()
+
         q = message_stats.value[0]
         embed = MessageEmbed()
         embed.fields.append(
             MessageEmbedField(name='Total Messages Sent', value=q[0] or '0', inline=True))
         embed.fields.append(
             MessageEmbedField(name='Total Characters Sent', value=q[1] or '0', inline=True))
+
         if deleted.value:
             embed.fields.append(
                 MessageEmbedField(name='Total Deleted Messages', value=deleted.value[0][0], inline=True))
+
         embed.fields.append(
             MessageEmbedField(name='Total Custom Emojis', value=q[2] or '0', inline=True))
         embed.fields.append(
             MessageEmbedField(name='Total Mentions', value=q[3] or '0', inline=True))
         embed.fields.append(
             MessageEmbedField(name='Total Attachments', value=q[4] or '0', inline=True))
+
         if reactions_given.value:
-            reactions_given = reactions_given.value
+            reactions_val = reactions_given.value
             embed.fields.append(
-                MessageEmbedField(name='Total Reactions', value=sum(i[0] for i in reactions_given), inline=True))
+                MessageEmbedField(name='Total Reactions', value=sum(i[0] for i in reactions_val), inline=True))
             emoji = (
-                reactions_given[0][2]
-                if not reactions_given[0][1] else
-                '<:{}:{}>'.format(reactions_given[0][2], reactions_given[0][1])
+                reactions_val[0][2]
+                if not reactions_val[0][1] else
+                '<:{}:{}>'.format(reactions_val[0][2], reactions_val[0][1])
             )
             embed.fields.append(
                 MessageEmbedField(name='Most Used Reaction', value='{} (used {} times)'.format(
                     emoji,
-                    reactions_given[0][0],
+                    reactions_val[0][0],
                 ), inline=True))
+
         if emojis.value:
-            emojis = list(emojis.value)
-            if emojis:
+            emojis_val = list(emojis.value)
+            if emojis_val:
                 embed.add_field(
                     name='Most Used Emoji',
-                    value='<:{1}:{0}> (`{1}`, used {2} times)'.format(*emojis[0]))
+                    value='<:{1}:{0}> (`{1}`, used {2} times)'.format(*emojis_val[0]))
+
         embed.thumbnail = MessageEmbedThumbnail(url=user.avatar_url)
         embed.color = get_dominant_colors_user(user)
         event.msg.reply('', embed=embed)
+
     @Plugin.command('emojistats', '<mode:str> <sort:str>', level=CommandLevels.MOD)
     def emojistats_custom(self, event, mode, sort):
         if mode not in ('server', 'global'):
             raise CommandFail('invalid emoji mode, must be `server` or `global`')
         if sort not in ('least', 'most'):
             raise CommandFail('invalid emoji sort, must be `least` or `most`')
+
         order = 'DESC' if sort == 'most' else 'ASC'
         if mode == 'server':
             q = CUSTOM_EMOJI_STATS_SERVER_SQL.format(order, guild=event.guild.id)
         else:
             q = CUSTOM_EMOJI_STATS_GLOBAL_SQL.format(order, guild=event.guild.id)
+
         q = list(GuildEmoji.raw(q).tuples())
         tbl = MessageTable()
         tbl.set_header('Count', 'Name', 'ID')
         for emoji_id, name, count in q:
             tbl.add(count, name, emoji_id)
         event.msg.reply(tbl.compile())
+
     @Plugin.command('prune', '[uses:int]', level=CommandLevels.ADMIN, group='invites')
     def invites_prune(self, event, uses=1):
         invites = [
             i for i in event.guild.get_invites()
-            if i.uses <= uses and i.created_at < (datetime.utcnow() - timedelta(hours=1))
+            if i.uses <= uses and i.created_at < (datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(hours=1))
         ]
         if not invites:
             return event.msg.reply('I didn\'t find any invites matching your criteria')
+
         msg = event.msg.reply(
             'Ok, a total of {} invites created by {} users with {} total uses would be pruned.'.format(
                 len(invites),
@@ -456,6 +534,7 @@ class AdminPlugin(Plugin):
         msg.chain(False).\
             add_reaction(GREEN_TICK_EMOJI).\
             add_reaction(RED_TICK_EMOJI)
+
         try:
             mra_event = self.wait_for_event(
                 'MessageReactionAdd',
@@ -468,6 +547,7 @@ class AdminPlugin(Plugin):
             msg.reply('Not executing invite prune')
             msg.delete()
             return
+
         msg.delete()
         if mra_event.emoji.id == GREEN_TICK_EMOJI_ID:
             msg = msg.reply('Pruning invites...')
@@ -476,6 +556,7 @@ class AdminPlugin(Plugin):
             msg.edit('Ok, invite prune completed')
         else:
             msg = msg.reply('Not pruning invites')
+
     @Plugin.command(
         'clean',
         '<user:user|snowflake> [count:int] [emoji:str]',
@@ -486,23 +567,26 @@ class AdminPlugin(Plugin):
             user = user.id
         if count > 50:
             raise CommandFail('cannot clean more than 50 reactions')
+
         lock = rdb.lock('clean-reactions-{}'.format(user))
         if not lock.acquire(blocking=False):
             raise CommandFail('already running a clean on user')
-        query = [
+
+        query_filters = [
             (Reaction.user_id == user),
             (Message.guild_id == event.guild.id),
             (Message.deleted == 0),
         ]
+
         if emoji:
             emoji_id = EMOJI_RE.findall(emoji)
             if emoji_id:
-                query.append((Reaction.emoji_id == emoji_id[0]))
+                query_filters.append((Reaction.emoji_id == emoji_id[0]))
             else:
-                # TODO: validation?
-                query.append((Reaction.emoji_name == emoji))
+                query_filters.append((Reaction.emoji_name == emoji))
+
         try:
-            reactions = list(Reaction.select(
+            reactions_query = Reaction.select(
                 Reaction.message_id,
                 Reaction.emoji_id,
                 Reaction.emoji_name,
@@ -511,32 +595,38 @@ class AdminPlugin(Plugin):
                 Message,
                 on=(Message.id == Reaction.message_id),
             ).where(
-                reduce(operator.and_, query)
-            ).order_by(Reaction.message_id.desc()).limit(count).tuples())
+                functools.reduce(operator.and_, query_filters)
+            ).order_by(Reaction.message_id.desc()).limit(count).tuples()
+            
+            reactions = list(getattr(reactions_query, 'async')())
+
             if not reactions:
                 raise CommandFail('no reactions to purge')
+
             msg = event.msg.reply('Hold on while I clean {} reactions'.format(
                 len(reactions)
             ))
             for message_id, emoji_id, emoji_name, channel_id in reactions:
                 if emoji_id:
-                    emoji = '{}:{}'.format(emoji_name, emoji_id)
+                    emoji_key = '{}:{}'.format(emoji_name, emoji_id)
                 else:
-                    emoji = emoji_name
+                    emoji_key = emoji_name
                 self.client.api.channels_messages_reactions_delete(
                     channel_id,
                     message_id,
-                    emoji,
+                    emoji_key,
                     user)
             msg.edit('Ok, I cleaned {} reactions'.format(
                 len(reactions),
             ))
         finally:
             lock.release()
+
     @Plugin.command('log', '<user:user|snowflake>', group='voice', level=CommandLevels.MOD)
     def voice_log(self, event, user):
         if isinstance(user, DiscoUser):
             user = user.id
+
         sessions = GuildVoiceSession.select(
             GuildVoiceSession.user_id,
             GuildVoiceSession.channel_id,
@@ -546,6 +636,7 @@ class AdminPlugin(Plugin):
             (GuildVoiceSession.user_id == user) &
             (GuildVoiceSession.guild_id == event.guild.id)
         ).order_by(GuildVoiceSession.started_at.desc()).limit(10)
+
         tbl = MessageTable()
         tbl.set_header('Channel', 'Joined At', 'Duration')
         for session in sessions:
@@ -553,16 +644,19 @@ class AdminPlugin(Plugin):
                 str(self.state.channels.get(session.channel_id) or 'UNKNOWN'),
                 '{} ({} ago)'.format(
                     session.started_at.isoformat(),
-                    humanize.naturaldelta(datetime.utcnow() - session.started_at)),
+                    humanize.naturaldelta(datetime.now(timezone.utc).replace(tzinfo=None) - session.started_at)),
                 humanize.naturaldelta(session.ended_at - session.started_at) if session.ended_at else 'Active')
         event.msg.reply(tbl.compile())
+
     @Plugin.command('join', '<name:str>', aliases=['add', 'give'])
     def join_role(self, event, name):
         if not event.config.group_roles:
             return
+
         role = event.guild.roles.get(event.config.group_roles.get(name.lower()))
         if not role:
             raise CommandFail('invalid or unknown group')
+
         has_any_admin_perms = any(role.permissions.can(i) for i in (
             Permissions.KICK_MEMBERS,
             Permissions.BAN_MEMBERS,
@@ -578,37 +672,46 @@ class AdminPlugin(Plugin):
             Permissions.MANAGE_WEBHOOKS,
             Permissions.MANAGE_EMOJIS,
         ))
-        # Sanity check
+
         if has_any_admin_perms:
             raise CommandFail('cannot join group with admin permissions')
+
         member = event.guild.get_member(event.author)
         if role.id in member.roles:
             raise CommandFail('you are already a member of that group')
+
         member.add_role(role)
         if event.config.group_confirm_reactions:
             event.msg.add_reaction(GREEN_TICK_EMOJI)
             return
         raise CommandSuccess('you have joined the {} group'.format(name))
+
     @Plugin.command('leave', '<name:snowflake|str>', aliases=['remove', 'take'])
     def leave_role(self, event, name):
         if not event.config.group_roles:
             return
+
         role_id = event.config.group_roles.get(name.lower())
         if not role_id or role_id not in event.guild.roles:
             raise CommandFail('invalid or unknown group')
+
         member = event.guild.get_member(event.author)
         if role_id not in member.roles:
             raise CommandFail('you are not a member of that group')
+
         member.remove_role(role_id)
         if event.config.group_confirm_reactions:
             event.msg.add_reaction(GREEN_TICK_EMOJI)
             return
         raise CommandSuccess('you have left the {} group'.format(name))
+
     @Plugin.command('unlock', '<role_id:snowflake>', group='role', level=CommandLevels.ADMIN)
     def unlock_role(self, event, role_id):
         if role_id not in event.config.locked_roles:
             raise CommandFail('role %s is not locked' % role_id)
+
         if role_id in self.unlocked_roles and self.unlocked_roles[role_id] > time.time():
             raise CommandFail('role %s is already unlocked' % role_id)
+
         self.unlocked_roles[role_id] = time.time() + 300
         raise CommandSuccess('role is unlocked for 5 minutes')
