@@ -282,7 +282,7 @@ class SQLPlugin(Plugin):
             unit,
             '{} {}'.format(amount, unit),
             event.guild.id,
-            '\s?{}\s?'.format(word),
+            r'\s?{}\s?'.format(word),
             unit
         ).tuples())
         sql_duration = time.time() - start
@@ -323,7 +323,7 @@ class SQLPlugin(Plugin):
         sql = """
             SELECT word, count(*)
             FROM (
-                SELECT regexp_split_to_table(content, '\s') as word
+                r'SELECT regexp_split_to_table(content, \'\s\') as word'
                 FROM messages
                 WHERE {}=%s
                 LIMIT 3000000
