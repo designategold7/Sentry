@@ -50,6 +50,6 @@ psycopg2-binary
 psycogreen
 click
 werkzeug
-holster
+holster==1.0.11
 websocket-client
 datadog
