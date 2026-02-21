@@ -1,4 +1,4 @@
-version: '2'
+version: '3'
 services:
   db:
     build: ./docker/database/
@@ -37,6 +37,7 @@ services:
     command: npm run serve
     volumes:
       - ./frontend:/opt/frontend
+      - /opt/frontend/node_modules
     ports:
       - "8080:8080"
     depends_on:
