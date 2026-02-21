@@ -23,8 +23,21 @@ from sentry.sql import init_db
 from sentry.redis import rdb
 import sentry.models
 from peewee import ModelInsert
-if not hasattr(ModelInsert, 'upsert'):
-    ModelInsert.upsert = lambda self, *args, **kwargs: self.on_conflict_replace()
+def patched_upsert(self, *args, **kwargs):
+    self._is_upsert = True
+    target = kwargs.get('target') or (args[0] if args else None)
+    if target:
+        if isinstance(target, str): target = [target]
+        return self.on_conflict(conflict_target=target, action='NOTHING')
+    return self.on_conflict(action='NOTHING')
+ModelInsert.upsert = patched_upsert
+original_execute = ModelInsert.execute
+def patched_execute(self, *args, **kwargs):
+    result = original_execute(self, *args, **kwargs)
+    if not result and getattr(self, '_is_upsert', False):
+        return [None]
+    return result
+ModelInsert.execute = patched_execute
 from sentry.models.guild import Guild, GuildBan
 from sentry.models.message import Command
 from sentry.models.notification import Notification
@@ -185,7 +198,7 @@ class CorePlugin(Plugin):
         with self.send_control_message() as embed:
             embed.title = 'Resumed'
             embed.color = 0xffb347
-            trace_str = ' / '.join(event.trace) if event.trace else 'Unknown'
+            trace_str = (' / '.join(event.trace) if event.trace else 'Unknown')[:1000]
             embed.add_field(name='Gateway Trace', value=trace_str, inline=False)
             embed.add_field(name='Replayed Events', value=str(self.client.gw.replayed_events))
     @Plugin.listen('Ready', priority=Priority.BEFORE)
@@ -195,7 +208,7 @@ class CorePlugin(Plugin):
         with self.send_control_message() as embed:
             embed.title = 'Connected'
             embed.color = 0x77dd77
-            trace_str = ' / '.join(event.trace) if event.trace else 'Unknown'
+            trace_str = (' / '.join(event.trace) if event.trace else 'Unknown')[:1000]
             embed.add_field(name='Gateway Trace', value=trace_str, inline=False)
     @Plugin.listen('GuildCreate', priority=Priority.BEFORE, conditional=lambda e: not e.created)
     def on_guild_create(self, event):
@@ -342,7 +355,7 @@ class CorePlugin(Plugin):
             return
         code = cmd.func.__code__
         lines, firstlineno = inspect.getsourcelines(code)
-        event.msg.reply('<https://github.com/b1naryth1ef/rowboat/blob/master/{}#L{}-{}>'.format(code.co_filename, firstlineno, firstlineno + len(lines)))
+        event.msg.reply('<https://github.com/designategold7/Sentry/blob/master/{}#L{}-{}>'.format(code.co_filename, firstlineno, firstlineno + len(lines)))
     @Plugin.command('eval', level=-1)
     def command_eval(self, event):
         ctx = {'bot': self.bot, 'client': self.bot.client, 'state': self.bot.client.state, 'event': event, 'msg': event.msg, 'guild': event.msg.guild, 'channel': event.msg.channel, 'author': event.msg.author}
