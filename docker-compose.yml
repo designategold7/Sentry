@@ -2,9 +2,10 @@ version: '3'
 services:
   db:
     build: ./docker/database/
+    environment:
+      - POSTGRES_DB=sentry
     volumes:
       - ./.data:/var/lib/postgresql/data
-
   redis:
     image: redis:3.2
     command: redis-server --appendonly yes
@@ -12,7 +13,6 @@ services:
       - ./.data:/data
     ports:
       - "6379:6379"
-
   web:
     build: .
     command: python manage.py serve -r
@@ -23,7 +23,6 @@ services:
     depends_on:
       - db
       - redis
-
   frontend:
     build: ./frontend/
     environment:
@@ -36,15 +35,15 @@ services:
       - "8080:8080"
     depends_on:
       - web
-
   bot:
     build: .
     command: python manage.py bot -e docker
     volumes:
       - .:/opt/sentry
+    ports:
+      - "7171:7171"
     depends_on:
       - web
-
   workers:
     build: .
     command: python manage.py workers
