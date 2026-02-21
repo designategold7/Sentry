@@ -1,0 +1,7 @@
+language: python
+cache: pip
+services:
+  - redis-server
+python:
+  - '3.12'
+script: 'py.test tests'
