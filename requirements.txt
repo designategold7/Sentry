@@ -53,3 +53,5 @@ werkzeug
 holster==1.0.11
 websocket-client
 datadog
+fuzzywuzzy
+python-Levenshtein
