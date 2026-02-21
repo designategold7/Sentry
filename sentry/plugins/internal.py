@@ -1,18 +1,19 @@
 import gevent
 from gevent.lock import Semaphore
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from peewee import fn
 from disco.gateway.packets import OPCode, RECV
 from disco.types.message import MessageTable, MessageEmbed
 
-from rowboat.redis import rdb
-from rowboat.plugins import BasePlugin as Plugin
-from rowboat.util.redis import RedisSet
-from rowboat.models.event import Event
-from rowboat.models.user import User
-from rowboat.models.channel import Channel
-from rowboat.models.message import Command, Message
+# SENTRY REBRANDING: Updated from rowboat to sentry
+from sentry.redis import rdb
+from sentry.plugins import BasePlugin as Plugin
+from sentry.util.redis import RedisSet
+from sentry.models.event import Event
+from sentry.models.user import User
+from sentry.models.channel import Channel
+from sentry.models.message import Command, Message
 
 
 class InternalPlugin(Plugin):
@@ -38,7 +39,8 @@ class InternalPlugin(Plugin):
         tbl.set_header('ID', 'Command', 'Error')
 
         for err in q:
-            tbl.add(err.message_id, u'{}.{}'.format(err.plugin, err.command), err.traceback.split('\n')[-2])
+            # Python 3: Replaced u'' with standard f-strings or .format()
+            tbl.add(err.message_id, '{}.{}'.format(err.plugin, err.command), err.traceback.split('\n')[-2])
 
         event.msg.reply(tbl.compile())
 
@@ -58,15 +60,17 @@ class InternalPlugin(Plugin):
 
         embed = MessageEmbed()
         embed.title = '{}.{} ({})'.format(cmd.plugin, cmd.command, cmd.message.id)
-        embed.set_author(name=unicode(cmd.message.author), icon_url=cmd.message.author.get_avatar_url())
+        
+        # Python 3: Replaced unicode() with str()
+        embed.set_author(name=str(cmd.message.author), icon_url=cmd.message.author.get_avatar_url())
         embed.color = 0x77dd77 if cmd.success else 0xff6961
 
         if not cmd.success:
-            embed.description = u'```{}```'.format(cmd.traceback)
+            embed.description = '```{}```'.format(cmd.traceback)
 
         embed.add_field(name='Message', value=cmd.message.content)
-        embed.add_field(name='Channel', value=u'{} `{}`'.format(cmd.message.channel.name, cmd.message.channel.channel_id))
-        embed.add_field(name='Guild', value=unicode(cmd.message.guild_id))
+        embed.add_field(name='Channel', value='{} `{}`'.format(cmd.message.channel.name, cmd.message.channel.channel_id))
+        embed.add_field(name='Guild', value=str(cmd.message.guild_id))
         event.msg.reply(embed=embed)
 
     @Plugin.command('usage', group='commands', level=-1)
@@ -132,9 +136,10 @@ class InternalPlugin(Plugin):
 
     @Plugin.schedule(300, init=False)
     def prune_old_events(self):
-        # Keep 24 hours of all events
+        # Python 3.12 Modernization: Replaced utcnow()
+        now = datetime.now(timezone.utc).replace(tzinfo=None)
         Event.delete().where(
-            (Event.timestamp > datetime.utcnow() - timedelta(hours=24))
+            (Event.timestamp > now - timedelta(hours=24))
         ).execute()
 
     @Plugin.listen('Ready')
@@ -158,7 +163,7 @@ class InternalPlugin(Plugin):
                 continue
 
             with self.lock:
-                Event.insert_many(filter(bool, [
+                Event.insert_many(list(filter(bool, [
                     Event.prepare(self.session_id, event) for event in self.cache
-                ])).execute()
+                ]))).execute()
                 self.cache = []
