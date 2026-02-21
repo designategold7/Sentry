@@ -15,6 +15,8 @@ from disco.types.message import MessageEmbed
 from disco.api.http import APIException
 from disco.bot.command import CommandEvent
 from disco.util.sanitize import S
+
+# SENTRY REBRAND & MODERNIZATION
 from sentry import ENV
 from sentry.util import LocalProxy
 from sentry.util.stats import timed
@@ -124,6 +126,7 @@ class CorePlugin(Plugin):
 
                 self.log.info('Leaving guild %s', self.guilds[data['id']].name)
                 self.guilds[data['id']].leave()
+
     def unload(self, ctx):
         ctx['guilds'] = self.guilds
         ctx['startup'] = self.startup
@@ -318,7 +321,8 @@ class CorePlugin(Plugin):
                 embed.color = 0x77dd77
 
             embed.add_field(name='Gateway Server', value=event.trace[0], inline=False)
-            embed.add_field(name='Session Server', value=event.trace[1], inline=False) 
+            embed.add_field(name='Session Server', value=event.trace[1], inline=False)
+
     @Plugin.listen('GuildCreate', priority=Priority.BEFORE, conditional=lambda e: not e.created)
     def on_guild_create(self, event):
         try:
