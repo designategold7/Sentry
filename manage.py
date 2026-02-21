@@ -1,11 +1,5 @@
 #!/usr/bin/env python
 from gevent import monkey; monkey.patch_all()
-from werkzeug.serving import run_with_reloader
-from sentry import ENV
-from sentry.web import sentry_app
-from sentry.sql import init_db
-from disco.util.logging import LOG_FORMAT
-from yaml import load
 import os
 import copy
 import click
@@ -13,6 +7,10 @@ import signal
 import logging
 import gevent
 import subprocess
+from werkzeug.serving import run_simple
+from sentry import ENV
+from sentry.web import sentry_app
+from sentry.sql import init_db
 class BotSupervisor(object):
     def __init__(self, env={}):
         self.proc = None
@@ -46,33 +44,17 @@ def cli():
 @cli.command()
 @click.option('--reloader/--no-reloader', '-r', default=False)
 def serve(reloader):
-    def run():
-        from gevent.pywsgi import WSGIServer
-        WSGIServer(('0.0.0.0', 8686), sentry_app.app).serve_forever()
-    if reloader:
-        run_with_reloader(run)
-    else:
-        run()
+    init_db(ENV)
+    run_simple('0.0.0.0', 8686, sentry_app, use_reloader=reloader, use_debugger=True)
 @cli.command()
 @click.option('--env', '-e', default='local')
 def bot(env):
-    with open('config.yaml', 'r') as f:
-        config = load(f)
-    supervisor = BotSupervisor(env={
-        'ENV': env,
-        'DSN': config.get('DSN', ''),
-    })
-    supervisor.run_forever()
+    init_db(env)
+    BotSupervisor(env={'ENV': env}).run_forever()
 @cli.command()
-@click.option('--worker-id', '-w', default=0)
-def workers(worker_id):
-    from sentry.tasks import TaskWorker
-    file_handler = logging.FileHandler('worker-%s.log' % worker_id)
-    log = logging.getLogger()
-    file_handler.setFormatter(logging.Formatter(LOG_FORMAT))
-    log.addHandler(file_handler)
-    for logname in ['peewee', 'requests']:
-        logging.getLogger(logname).setLevel(logging.INFO)
+def workers():
+    from sentry.tasks.worker import TaskWorker
+    logging.getLogger('peewee').setLevel(logging.INFO)
     init_db(ENV)
     TaskWorker().run()
 @cli.command('add-global-admin')
@@ -84,43 +66,5 @@ def add_global_admin(user_id):
     rdb.sadd('global_admins', user_id)
     User.update(admin=True).where(User.user_id == user_id).execute()
     print('Ok, added {} as a global admin'.format(user_id))
-@cli.command('wh-add')
-@click.argument('guild-id')
-@click.argument('flag')
-def add_whitelist(guild_id, flag):
-    from sentry.models.guild import Guild
-    init_db(ENV)
-    flag = Guild.WhitelistFlags.get(flag)
-    if not flag:
-        print('Invalid flag')
-        return
-    try:
-        guild = Guild.get(guild_id=guild_id)
-    except Guild.DoesNotExist:
-        print('No guild exists with that id')
-        return
-    guild.whitelist.append(int(flag))
-    guild.save()
-    guild.emit_update()
-    print('added flag')
-@cli.command('wh-rmv')
-@click.argument('guild-id')
-@click.argument('flag')
-def rmv_whitelist(guild_id, flag):
-    from sentry.models.guild import Guild
-    init_db(ENV)
-    flag = Guild.WhitelistFlags.get(flag)
-    if not flag:
-        print('Invalid flag')
-        return
-    try:
-        guild = Guild.get(guild_id=guild_id)
-    except Guild.DoesNotExist:
-        print('No guild exists with that id')
-        return
-    guild.whitelist.remove(int(flag))
-    guild.save()
-    guild.emit_update()
-    print('removed flag')
 if __name__ == '__main__':
     cli()
