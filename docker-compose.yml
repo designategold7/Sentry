@@ -40,6 +40,7 @@ services:
       - /opt/frontend/node_modules
     ports:
       - "8080:8080"
+      - "8687:8687"
     depends_on:
       - web
     restart: always
