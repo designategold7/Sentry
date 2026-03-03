@@ -1,25 +1,29 @@
 import re
 import json
+import asyncio
 from urllib import parse as urlparse
+from functools import cached_property
+
+import discord
+from discord.ext import commands
+
 from holster.enum import Enum
-from disco.types.base import cached_property
-from disco.util.sanitize import S
-from disco.api.http import APIException
 from sentry.redis import rdb
 from sentry.util.stats import timed
 from sentry.util.zalgo import ZALGO_RE
-from sentry.plugins import SentryPlugin as Plugin
 from sentry.types import SlottedModel, Field, ListField, DictField, ChannelField, snowflake, lower
 from sentry.types.plugin import PluginConfig
 from sentry.models.message import Message
 from sentry.plugins.modlog import Actions
 from sentry.constants import INVITE_LINK_RE, URL_RE
+
 CensorReason = Enum(
     'INVITE',
     'DOMAIN',
     'WORD',
     'ZALGO',
 )
+
 class CensorSubConfig(SlottedModel):
     filter_zalgo = Field(bool, default=True)
     filter_invites = Field(bool, default=True)
@@ -31,175 +35,159 @@ class CensorSubConfig(SlottedModel):
     domains_blacklist = ListField(lower, default=[])
     blocked_words = ListField(lower, default=[])
     blocked_tokens = ListField(lower, default=[])
+
     @cached_property
     def blocked_re(self):
         return re.compile('({})'.format('|'.join(
-            list(map(re.escape, self.blocked_tokens)) +
-            list(map(lambda k: '\\b{}\\b'.format(re.escape(k)), self.blocked_words))
+            self.blocked_words +
+            [r'\b{}\b'.format(w) for w in self.blocked_tokens]
         )), re.I)
+
 class CensorConfig(PluginConfig):
     levels = DictField(int, CensorSubConfig)
-    channels = DictField(ChannelField, CensorSubConfig)
-# It's bad kids!
+
 class Censorship(Exception):
-    def __init__(self, reason, event, ctx):
+    def __init__(self, reason, message, ctx):
         self.reason = reason
-        self.event = event
+        self.message = message
         self.ctx = ctx
-        self.content = S(event.content, escape_codeblocks=True)
-    @property
-    def details(self):
-        if self.reason is CensorReason.INVITE:
-            if self.ctx['guild']:
-                return 'invite `{}` to {}'.format(
-                    self.ctx['invite'],
-                    S(self.ctx['guild']['name'], escape_codeblocks=True)
-                )
-            else:
-                return 'invite `{}`'.format(self.ctx['invite'])
-        elif self.reason is CensorReason.DOMAIN:
-            if self.ctx['hit'] == 'whitelist':
-                return 'domain `{}` is not in whitelist'.format(S(self.ctx['domain'], escape_codeblocks=True))
-            else:
-                return 'domain `{}` is in blacklist'.format(S(self.ctx['domain'], escape_codeblocks=True))
-        elif self.reason is CensorReason.WORD:
-            return 'found blacklisted words `{}`'.format(
-                ', '.join([S(i, escape_codeblocks=True) for i in self.ctx['words']]))
-        elif self.reason is CensorReason.ZALGO:
-            return 'found zalgo at position `{}` in text'.format(
-                self.ctx['position']
+
+class CensorPlugin(commands.Cog):
+    def __init__(self, bot):
+        self.bot = bot
+
+    async def on_censor(self, message, censorship):
+        try:
+            await message.delete()
+        except discord.HTTPException:
+            pass
+
+        modlog = self.bot.get_cog('ModLogPlugin')
+        if modlog:
+            await modlog.log_action_ext(
+                Actions.CENSORED,
+                message.guild.id,
+                member=message.author,
+                c=censorship,
+                msg=message
             )
-@Plugin.with_config(CensorConfig)
-class CensorPlugin(Plugin):
-    def compute_relevant_configs(self, event, author):
-        if event.channel_id in event.config.channels:
-            yield event.config.channels[event.channel.id]
-        if event.config.levels:
-            user_level = int(self.bot.plugins.get('CorePlugin').get_level(event.guild, author))
-            for level, config in event.config.levels.items():
-                if user_level <= level:
-                    yield config
-    def get_invite_info(self, code):
-        if rdb.exists('inv:{}'.format(code)):
-            return json.loads(rdb.get('inv:{}'.format(code)))
-        try:
-            obj = self.client.api.invites_get(code)
-        except:
+
+    @commands.Cog.listener()
+    async def on_message(self, message):
+        await self.process_message(message)
+
+    @commands.Cog.listener()
+    async def on_message_edit(self, before, after):
+        await self.process_message(after)
+
+    async def process_message(self, message):
+        if message.author.bot or not message.guild:
             return
-        obj = {
-            'id': obj.guild.id,
-            'name': obj.guild.name,
-            'icon': obj.guild.icon
-        }
-        # Cache for 12 hours
-        rdb.setex('inv:{}'.format(code), json.dumps(obj), 43200)
-        return obj
-    @Plugin.listen('MessageUpdate')
-    def on_message_update(self, event):
-        try:
-            msg = Message.get(id=event.id)
-        except Message.DoesNotExist:
-            self.log.warning('Not censoring MessageUpdate for id %s, %s, no stored message', event.channel_id, event.id)
+
+        core = self.bot.get_cog('CorePlugin')
+        if not core: return
+
+        guild_config = core.get_config(message.guild.id)
+        if not guild_config or not hasattr(guild_config.plugins, 'censor'):
             return
-        if not event.content:
+
+        user_level = int(core.get_level(message.guild.id, message.author))
+        censor_config = guild_config.plugins.censor
+
+        # Find the highest applicable config level
+        applicable_configs = [c for l, c in censor_config.levels.items() if user_level <= l]
+        if not applicable_configs:
             return
-        return self.on_message_create(
-            event,
-            author=event.guild.get_member(msg.author_id))
-    @Plugin.listen('MessageCreate')
-    def on_message_create(self, event, author=None):
-        author = author or event.author
-        if author.id == self.state.me.id:
-            return
-        if event.webhook_id:
-            return
-        configs = list(self.compute_relevant_configs(event, author))
-        if not configs:
-            return
-        tags = {'guild_id': event.guild.id, 'channel_id': event.channel.id}
+            
+        # Take the most restrictive/highest level applying to user
+        config = sorted(applicable_configs, key=lambda x: list(censor_config.levels.values()).index(x))[0]
+
+        tags = {'guild_id': message.guild.id, 'channel_id': message.channel.id}
         with timed('sentry.plugin.censor.duration', tags=tags):
             try:
-                # TODO: perhaps imap here? how to raise exception then?
-                for config in configs:
-                    if config.filter_zalgo:
-                        self.filter_zalgo(event, config)
-                    if config.filter_invites:
-                        self.filter_invites(event, config)
-                    if config.filter_domains:
-                        self.filter_domains(event, config)
-                    if config.blocked_words or config.blocked_tokens:
-                        self.filter_blocked_words(event, config)
+                if config.filter_zalgo:
+                    self.filter_zalgo(message, config)
+                if config.filter_invites:
+                    await self.filter_invites(message, config)
+                if config.filter_domains:
+                    self.filter_domains(message, config)
+                if config.blocked_tokens or config.blocked_words:
+                    self.filter_blocked_words(message, config)
             except Censorship as c:
-                self.call(
-                    'ModLogPlugin.create_debounce',
-                    event,
-                    ['MessageDelete'],
-                    message_id=event.message.id,
-                )
-                try:
-                    event.delete()
-                    self.call(
-                        'ModLogPlugin.log_action_ext',
-                        Actions.CENSORED,
-                        event.guild.id,
-                        e=event,
-                        c=c)
-                except APIException:
-                    self.log.exception('Failed to delete censored message: ')
-    def filter_zalgo(self, event, config):
-        s = ZALGO_RE.search(event.content)
-        if s:
-            raise Censorship(CensorReason.ZALGO, event, ctx={
-                'position': s.start()
+                await self.on_censor(message, c)
+
+    def filter_zalgo(self, message, config):
+        zalgo = ZALGO_RE.search(message.content)
+        if zalgo:
+            raise Censorship(CensorReason.ZALGO, message, ctx={
+                'position': zalgo.span()
             })
-    def filter_invites(self, event, config):
-        invites = INVITE_LINK_RE.findall(event.content)
-        for _, invite in invites:
-            invite_info = self.get_invite_info(invite)
-            need_whitelist = (
-                config.invites_guild_whitelist or
-                (config.invites_whitelist or not config.invites_blacklist)
-            )
-            whitelisted = False
-            if invite_info and invite_info.get('id') in config.invites_guild_whitelist:
-                whitelisted = True
-            if invite.lower() in config.invites_whitelist:
-                whitelisted = True
-            if need_whitelist and not whitelisted:
-                raise Censorship(CensorReason.INVITE, event, ctx={
-                    'hit': 'whietlist',
+
+    async def filter_invites(self, message, config):
+        invites = INVITE_LINK_RE.findall(message.content)
+        for invite in invites:
+            def fetch_invite():
+                # Checking invites requires API hit, offload to thread or use async fetch
+                try:
+                    import requests
+                    res = requests.get(f'https://discord.com/api/v9/invites/{invite}?with_counts=true')
+                    if res.status_code == 200:
+                        return res.json()
+                except Exception:
+                    pass
+                return None
+
+            invite_data = await asyncio.to_thread(fetch_invite)
+            invite_info = invite_data.get('guild', {}) if invite_data else {}
+
+            if invite_info and int(invite_info.get('id', 0)) == message.guild.id:
+                continue
+
+            if invite_info and int(invite_info.get('id', 0)) in config.invites_guild_whitelist:
+                continue
+
+            if (config.invites_whitelist or not config.invites_blacklist) \
+                    and invite.lower() not in config.invites_whitelist:
+                raise Censorship(CensorReason.INVITE, message, ctx={
+                    'hit': 'whitelist',
                     'invite': invite,
                     'guild': invite_info,
                 })
             elif config.invites_blacklist and invite.lower() in config.invites_blacklist:
-                raise Censorship(CensorReason.INVITE, event, ctx={
+                raise Censorship(CensorReason.INVITE, message, ctx={
                     'hit': 'blacklist',
                     'invite': invite,
                     'guild': invite_info,
                 })
-    def filter_domains(self, event, config):
-        urls = URL_RE.findall(INVITE_LINK_RE.sub('', event.content))
+
+    def filter_domains(self, message, config):
+        urls = URL_RE.findall(INVITE_LINK_RE.sub('', message.content))
         for url in urls:
             try:
                 parsed = urlparse.urlparse(url)
-            except:
+            except Exception:
                 continue
-            if (config.domains_whitelist or not config.domains_blacklist)\
+
+            if (config.domains_whitelist or not config.domains_blacklist) \
                     and parsed.netloc.lower() not in config.domains_whitelist:
-                raise Censorship(CensorReason.DOMAIN, event, ctx={
+                raise Censorship(CensorReason.DOMAIN, message, ctx={
                     'hit': 'whitelist',
                     'url': url,
                     'domain': parsed.netloc,
                 })
             elif config.domains_blacklist and parsed.netloc.lower() in config.domains_blacklist:
-                raise Censorship(CensorReason.DOMAIN, event, ctx={
+                raise Censorship(CensorReason.DOMAIN, message, ctx={
                     'hit': 'blacklist',
                     'url': url,
                     'domain': parsed.netloc
                 })
-    def filter_blocked_words(self, event, config):
-        blocked_words = config.blocked_re.findall(event.content)
+
+    def filter_blocked_words(self, message, config):
+        blocked_words = config.blocked_re.findall(message.content)
         if blocked_words:
-            raise Censorship(CensorReason.WORD, event, ctx={
+            raise Censorship(CensorReason.WORD, message, ctx={
                 'words': blocked_words,
             })
+
+async def setup(bot):
+    await bot.add_cog(CensorPlugin(bot))
