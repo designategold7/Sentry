@@ -1,8 +1,10 @@
-from datetime import datetime
+import asyncio
+from datetime import datetime, timezone
 from holster.enum import Enum
 from peewee import BigIntegerField, IntegerField, SmallIntegerField, TextField, BooleanField, DateTimeField
 from playhouse.postgres_ext import BinaryJSONField
 from sentry.sql import BaseModel
+
 @BaseModel.register
 class User(BaseModel):
     user_id = BigIntegerField(primary_key=True)
@@ -10,16 +12,19 @@ class User(BaseModel):
     discriminator = SmallIntegerField()
     avatar = TextField(null=True)
     bot = BooleanField()
-    created_at = DateTimeField(default=datetime.utcnow)
+    created_at = DateTimeField(default=lambda: datetime.now(timezone.utc).replace(tzinfo=None))
     admin = BooleanField(default=False)
+    
     SQL = '''
         CREATE INDEX IF NOT EXISTS users_username_trgm ON users USING gin(username gin_trgm_ops);
     '''
+
     class Meta:
         db_table = 'users'
         indexes = (
             (('user_id', 'username', 'discriminator'), True),
         )
+
     def serialize(self, us=False):
         base = {
             'id': str(self.user_id),
@@ -31,51 +36,58 @@ class User(BaseModel):
         if us:
             base['admin'] = self.admin
         return base
+
     @property
     def id(self):
         return self.user_id
+
     @classmethod
     def ensure(cls, user, should_update=True):
-        return cls.from_disco_user(user)
+        return cls.from_disco_user(user, should_update)
+
     @classmethod
     def with_id(cls, uid):
         try:
             return User.get(user_id=uid)
         except User.DoesNotExist:
-            return
+            return None
+
     @classmethod
     def from_disco_user(cls, user, should_update=True):
-        # DEPRECATED
+        avatar_hash = user.avatar.key if getattr(user, 'avatar', None) else None
+        # d.py represents global names with discriminator '0'
+        discrim = int(user.discriminator) if getattr(user, 'discriminator', None) and str(user.discriminator).isdigit() else 0
+        
         obj, _ = cls.get_or_create(
             user_id=user.id,
             defaults={
-                'username': user.username,
-                'discriminator': user.discriminator,
-                'avatar': user.avatar,
-                'bot': user.bot
+                'username': getattr(user, 'name', user.display_name),
+                'discriminator': discrim,
+                'avatar': avatar_hash,
+                'bot': getattr(user, 'bot', False)
             })
+            
         if should_update:
             updates = {}
-            if obj.username != user.username:
-                updates['username'] = user.username
-            if obj.discriminator != user.discriminator:
-                updates['discriminator'] = user.discriminator
-            if obj.avatar != user.avatar:
-                updates['avatar'] = user.avatar
+            if obj.username != getattr(user, 'name', user.display_name):
+                updates['username'] = getattr(user, 'name', user.display_name)
+            if obj.discriminator != discrim:
+                updates['discriminator'] = discrim
+            if obj.avatar != avatar_hash:
+                updates['avatar'] = avatar_hash
+                
             if updates:
                 cls.update(**updates).where(User.user_id == user.id).execute()
         return obj
+
     def get_avatar_url(self, fmt='webp', size=1024):
         if not self.avatar:
             return None
-        return 'https://cdn.discordapp.com/avatars/{}/{}.{}?size={}'.format(
-            self.user_id,
-            self.avatar,
-            fmt,
-            size
-        )
+        return f'https://cdn.discordapp.com/avatars/{self.user_id}/{self.avatar}.{fmt}?size={size}'
+
     def __str__(self):
-        return '{}#{}'.format(self.username, str(self.discriminator).zfill(4))
+        return f'{self.username}#{str(self.discriminator).zfill(4)}'
+
 @BaseModel.register
 class Infraction(BaseModel):
     Types = Enum(
@@ -90,6 +102,7 @@ class Infraction(BaseModel):
         'WARNING',
         bitmask=False,
     )
+    
     guild_id = BigIntegerField()
     user_id = BigIntegerField()
     actor_id = BigIntegerField(null=True)
@@ -97,13 +110,15 @@ class Infraction(BaseModel):
     reason = TextField(null=True)
     metadata = BinaryJSONField(default={})
     expires_at = DateTimeField(null=True)
-    created_at = DateTimeField(default=datetime.utcnow)
+    created_at = DateTimeField(default=lambda: datetime.now(timezone.utc).replace(tzinfo=None))
     active = BooleanField(default=True)
+
     class Meta:
         db_table = 'infractions'
         indexes = (
             (('guild_id', 'user_id'), False),
         )
+
     def serialize(self, guild=None, user=None, actor=None, include_metadata=False):
         base = {
             'id': str(self.id),
@@ -111,8 +126,8 @@ class Infraction(BaseModel):
             'user': (user and user.serialize()) or {'id': str(self.user_id)},
             'actor': (actor and actor.serialize()) or {'id': str(self.actor_id)},
             'reason': self.reason,
-            'expires_at': self.expires_at,
-            'created_at': self.created_at,
+            'expires_at': self.expires_at.isoformat() if self.expires_at else None,
+            'created_at': self.created_at.isoformat() if self.created_at else None,
             'active': self.active,
         }
         base['type'] = {
@@ -122,230 +137,275 @@ class Infraction(BaseModel):
         if include_metadata:
             base['metadata'] = self.metadata
         return base
+
     @staticmethod
-    def admin_config(event):
-        return getattr(event.base_config.plugins, 'admin', None)
+    def admin_config(ctx):
+        return getattr(ctx.base_config.plugins, 'admin', None)
+
+    # All Moderation actions are now ASYNC to safely yield to the d.py event loop
     @classmethod
-    def temprole(cls, plugin, event, member, role_id, reason, expires_at):
-        User.from_disco_user(member.user)
-        # TODO: modlog
-        member.add_role(role_id, reason=reason)
-        cls.create(
-            guild_id=event.guild.id,
-            user_id=member.user.id,
-            actor_id=event.author.id,
-            type_=cls.Types.TEMPROLE,
-            reason=reason,
-            expires_at=expires_at,
-            metadata={'role': role_id})
+    async def temprole(cls, plugin, ctx, member, role_id, reason, expires_at):
+        await asyncio.to_thread(User.from_disco_user, member._user if hasattr(member, '_user') else member)
+        
+        role = ctx.guild.get_role(role_id)
+        if role:
+            await member.add_roles(role, reason=reason)
+            
+        def db_insert():
+            cls.create(
+                guild_id=ctx.guild.id,
+                user_id=member.id,
+                actor_id=ctx.author.id,
+                type_=cls.Types.TEMPROLE,
+                reason=reason,
+                expires_at=expires_at,
+                metadata={'role': role_id})
+        await asyncio.to_thread(db_insert)
+
     @classmethod
-    def kick(cls, plugin, event, member, reason):
+    async def kick(cls, plugin, ctx, member, reason):
         from sentry.plugins.modlog import Actions
-        User.from_disco_user(member.user)
-        # Prevent the GuildMemberRemove log event from triggering
-        plugin.call(
-            'ModLogPlugin.create_debounce',
-            event,
-            ['GuildMemberRemove'],
-            user_id=member.user.id
-        )
-        member.kick(reason=reason)
-        # Create a kick modlog event
-        plugin.call(
-            'ModLogPlugin.log_action_ext',
-            Actions.MEMBER_KICk,
-            event.guild.id,
-            member=member,
-            actor=str(event.author) if event.author.id != member.id else 'Automatic',
-            reason=reason or 'no reason'
-        )
-        cls.create(
-            guild_id=member.guild_id,
-            user_id=member.user.id,
-            actor_id=event.author.id,
-            type_=cls.Types.KICK,
-            reason=reason)
+        await asyncio.to_thread(User.from_disco_user, member._user if hasattr(member, '_user') else member)
+        
+        modlog = plugin.bot.get_cog('ModLogPlugin')
+        if modlog:
+            await modlog.create_debounce(ctx, ['on_member_remove'], user_id=member.id)
+            
+        await member.kick(reason=reason)
+        
+        if modlog:
+            await modlog.log_action_ext(
+                Actions.MEMBER_KICK,
+                ctx.guild.id,
+                member=member,
+                actor=str(ctx.author) if ctx.author.id != member.id else 'Automatic',
+                reason=reason or 'no reason'
+            )
+            
+        def db_insert():
+            cls.create(
+                guild_id=member.guild.id,
+                user_id=member.id,
+                actor_id=ctx.author.id,
+                type_=cls.Types.KICK,
+                reason=reason)
+        await asyncio.to_thread(db_insert)
+
     @classmethod
-    def tempban(cls, plugin, event, member, reason, expires_at):
+    async def tempban(cls, plugin, ctx, member, reason, expires_at):
         from sentry.plugins.modlog import Actions
-        User.from_disco_user(member.user)
-        plugin.call(
-            'ModLogPlugin.create_debounce',
-            event,
-            ['GuildMemberRemove', 'GuildBanAdd'],
-            user_id=member.user.id
-        )
-        member.ban(reason=reason)
-        plugin.call(
-            'ModLogPlugin.log_action_ext',
-            Actions.MEMBER_TEMPBAN,
-            event.guild.id,
-            member=member,
-            actor=str(event.author) if event.author.id != member.id else 'Automatic',
-            reason=reason or 'no reason',
-            expires=expires_at,
-        )
-        cls.create(
-            guild_id=member.guild_id,
-            user_id=member.user.id,
-            actor_id=event.author.id,
-            type_=cls.Types.TEMPBAN,
-            reason=reason,
-            expires_at=expires_at)
+        await asyncio.to_thread(User.from_disco_user, member._user if hasattr(member, '_user') else member)
+        
+        modlog = plugin.bot.get_cog('ModLogPlugin')
+        if modlog:
+            await modlog.create_debounce(ctx, ['on_member_remove', 'on_member_ban'], user_id=member.id)
+            
+        await member.ban(reason=reason)
+        
+        if modlog:
+            await modlog.log_action_ext(
+                Actions.MEMBER_TEMPBAN,
+                ctx.guild.id,
+                member=member,
+                actor=str(ctx.author) if ctx.author.id != member.id else 'Automatic',
+                reason=reason or 'no reason',
+                expires=expires_at,
+            )
+            
+        def db_insert():
+            cls.create(
+                guild_id=member.guild.id,
+                user_id=member.id,
+                actor_id=ctx.author.id,
+                type_=cls.Types.TEMPBAN,
+                reason=reason,
+                expires_at=expires_at)
+        await asyncio.to_thread(db_insert)
+
     @classmethod
-    def softban(cls, plugin, event, member, reason):
+    async def softban(cls, plugin, ctx, member, reason):
         from sentry.plugins.modlog import Actions
-        User.from_disco_user(member.user)
-        plugin.call(
-            'ModLogPlugin.create_debounce',
-            event,
-            ['GuildMemberRemove', 'GuildBanAdd', 'GuildBanRemove'],
-            user_id=member.user.id
-        )
-        member.ban(delete_message_days=7, reason=reason)
-        member.unban(reason=reason)
-        plugin.call(
-            'ModLogPlugin.log_action_ext',
-            Actions.MEMBER_SOFTBAN,
-            event.guild.id,
-            member=member,
-            actor=str(event.author) if event.author.id != member.id else 'Automatic',
-            reason=reason or 'no reason'
-        )
-        cls.create(
-            guild_id=member.guild_id,
-            user_id=member.user.id,
-            actor_id=event.author.id,
-            type_=cls.Types.SOFTBAN,
-            reason=reason)
+        await asyncio.to_thread(User.from_disco_user, member._user if hasattr(member, '_user') else member)
+        
+        modlog = plugin.bot.get_cog('ModLogPlugin')
+        if modlog:
+            await modlog.create_debounce(ctx, ['on_member_remove', 'on_member_ban', 'on_member_unban'], user_id=member.id)
+            
+        await member.ban(delete_message_seconds=604800, reason=reason) # 7 days
+        await member.unban(reason=reason)
+        
+        if modlog:
+            await modlog.log_action_ext(
+                Actions.MEMBER_SOFTBAN,
+                ctx.guild.id,
+                member=member,
+                actor=str(ctx.author) if ctx.author.id != member.id else 'Automatic',
+                reason=reason or 'no reason'
+            )
+            
+        def db_insert():
+            cls.create(
+                guild_id=member.guild.id,
+                user_id=member.id,
+                actor_id=ctx.author.id,
+                type_=cls.Types.SOFTBAN,
+                reason=reason)
+        await asyncio.to_thread(db_insert)
+
     @classmethod
-    def ban(cls, plugin, event, member, reason, guild):
+    async def ban(cls, plugin, ctx, member, reason, guild):
         from sentry.plugins.modlog import Actions
         if isinstance(member, int):
             user_id = member
+            member_str = str(user_id)
         else:
-            User.from_disco_user(member.user)
-            user_id = member.user.id
-        plugin.call(
-            'ModLogPlugin.create_debounce',
-            event,
-            ['GuildMemberRemove', 'GuildBanAdd'],
-            user_id=user_id,
-        )
-        guild.create_ban(user_id, reason=reason)
-        plugin.call(
-            'ModLogPlugin.log_action_ext',
-            Actions.MEMBER_BAN,
-            event.guild.id,
-            user=str(member),
-            user_id=user_id,
-            actor=str(event.author) if event.author.id != user_id else 'Automatic',
-            reason=reason or 'no reason'
-        )
-        cls.create(
-            guild_id=guild.id,
-            user_id=user_id,
-            actor_id=event.author.id,
-            type_=cls.Types.BAN,
-            reason=reason)
+            await asyncio.to_thread(User.from_disco_user, member._user if hasattr(member, '_user') else member)
+            user_id = member.id
+            member_str = str(member)
+            
+        modlog = plugin.bot.get_cog('ModLogPlugin')
+        if modlog:
+            await modlog.create_debounce(ctx, ['on_member_remove', 'on_member_ban'], user_id=user_id)
+            
+        import discord
+        await guild.ban(discord.Object(id=user_id), reason=reason)
+        
+        if modlog:
+            await modlog.log_action_ext(
+                Actions.MEMBER_BAN,
+                ctx.guild.id,
+                user=member_str,
+                user_id=user_id,
+                actor=str(ctx.author) if ctx.author.id != user_id else 'Automatic',
+                reason=reason or 'no reason'
+            )
+            
+        def db_insert():
+            cls.create(
+                guild_id=guild.id,
+                user_id=user_id,
+                actor_id=ctx.author.id,
+                type_=cls.Types.BAN,
+                reason=reason)
+        await asyncio.to_thread(db_insert)
+
     @classmethod
-    def warn(cls, plugin, event, member, reason, guild):
+    async def warn(cls, plugin, ctx, member, reason, guild):
         from sentry.plugins.modlog import Actions
-        User.from_disco_user(member.user)
-        user_id = member.user.id
-        cls.create(
-            guild_id=guild.id,
-            user_id=user_id,
-            actor_id=event.author.id,
-            type_=cls.Types.WARNING,
-            reason=reason)
-        plugin.call(
-            'ModLogPlugin.log_action_ext',
-            Actions.MEMBER_WARNED,
-            event.guild.id,
-            member=member,
-            actor=str(event.author) if event.author.id != member.id else 'Automatic',
-            reason=reason or 'no reason'
-        )
+        await asyncio.to_thread(User.from_disco_user, member._user if hasattr(member, '_user') else member)
+        user_id = member.id
+        
+        def db_insert():
+            cls.create(
+                guild_id=guild.id,
+                user_id=user_id,
+                actor_id=ctx.author.id,
+                type_=cls.Types.WARNING,
+                reason=reason)
+        await asyncio.to_thread(db_insert)
+        
+        modlog = plugin.bot.get_cog('ModLogPlugin')
+        if modlog:
+            await modlog.log_action_ext(
+                Actions.MEMBER_WARNED,
+                ctx.guild.id,
+                member=member,
+                actor=str(ctx.author) if ctx.author.id != member.id else 'Automatic',
+                reason=reason or 'no reason'
+            )
+
     @classmethod
-    def mute(cls, plugin, event, member, reason):
+    async def mute(cls, plugin, ctx, member, reason):
         from sentry.plugins.modlog import Actions
-        admin_config = cls.admin_config(event)
-        plugin.call(
-            'ModLogPlugin.create_debounce',
-            event,
-            ['GuildMemberUpdate'],
-            user_id=member.user.id,
-            role_id=admin_config.mute_role,
-        )
-        member.add_role(admin_config.mute_role, reason=reason)
-        plugin.call(
-            'ModLogPlugin.log_action_ext',
-            Actions.MEMBER_MUTED,
-            event.guild.id,
-            member=member,
-            actor=str(event.author) if event.author.id != member.id else 'Automatic',
-            reason=reason or 'no reason'
-        )
-        cls.create(
-            guild_id=event.guild.id,
-            user_id=member.user.id,
-            actor_id=event.author.id,
-            type_=cls.Types.MUTE,
-            reason=reason,
-            metadata={'role': admin_config.mute_role})
+        admin_config = cls.admin_config(ctx)
+        role_id = admin_config.mute_role if admin_config else None
+        role = ctx.guild.get_role(role_id) if role_id else None
+        
+        if role:
+            modlog = plugin.bot.get_cog('ModLogPlugin')
+            if modlog:
+                await modlog.create_debounce(ctx, ['on_member_update'], user_id=member.id, role_id=role_id)
+                
+            await member.add_roles(role, reason=reason)
+            
+            if modlog:
+                await modlog.log_action_ext(
+                    Actions.MEMBER_MUTED,
+                    ctx.guild.id,
+                    member=member,
+                    actor=str(ctx.author) if ctx.author.id != member.id else 'Automatic',
+                    reason=reason or 'no reason'
+                )
+                
+            def db_insert():
+                cls.create(
+                    guild_id=ctx.guild.id,
+                    user_id=member.id,
+                    actor_id=ctx.author.id,
+                    type_=cls.Types.MUTE,
+                    reason=reason,
+                    metadata={'role': role_id})
+            await asyncio.to_thread(db_insert)
+
     @classmethod
-    def tempmute(cls, plugin, event, member, reason, expires_at):
+    async def tempmute(cls, plugin, ctx, member, reason, expires_at):
         from sentry.plugins.modlog import Actions
-        admin_config = cls.admin_config(event)
-        if not admin_config.mute_role:
-            plugin.log.warning('Cannot tempmute member %s, no tempmute role', member.id)
+        admin_config = cls.admin_config(ctx)
+        role_id = admin_config.mute_role if admin_config else None
+        role = ctx.guild.get_role(role_id) if role_id else None
+        
+        if not role:
+            print(f'Cannot tempmute member {member.id}, no tempmute role found')
             return
-        plugin.call(
-            'ModLogPlugin.create_debounce',
-            event,
-            ['GuildMemberUpdate'],
-            user_id=member.user.id,
-            role_id=admin_config.mute_role,
-        )
-        member.add_role(admin_config.mute_role, reason=reason)
-        plugin.call(
-            'ModLogPlugin.log_action_ext',
-            Actions.MEMBER_TEMP_MUTED,
-            event.guild.id,
-            member=member,
-            actor=str(event.author) if event.author.id != member.id else 'Automatic',
-            reason=reason or 'no reason',
-            expires=expires_at,
-        )
-        cls.create(
-            guild_id=event.guild.id,
-            user_id=member.user.id,
-            actor_id=event.author.id,
-            type_=cls.Types.TEMPMUTE,
-            reason=reason,
-            expires_at=expires_at,
-            metadata={'role': admin_config.mute_role})
+            
+        modlog = plugin.bot.get_cog('ModLogPlugin')
+        if modlog:
+            await modlog.create_debounce(ctx, ['on_member_update'], user_id=member.id, role_id=role_id)
+            
+        await member.add_roles(role, reason=reason)
+        
+        if modlog:
+            await modlog.log_action_ext(
+                Actions.MEMBER_TEMP_MUTED,
+                ctx.guild.id,
+                member=member,
+                actor=str(ctx.author) if ctx.author.id != member.id else 'Automatic',
+                reason=reason or 'no reason',
+                expires=expires_at,
+            )
+            
+        def db_insert():
+            cls.create(
+                guild_id=ctx.guild.id,
+                user_id=member.id,
+                actor_id=ctx.author.id,
+                type_=cls.Types.TEMPMUTE,
+                reason=reason,
+                expires_at=expires_at,
+                metadata={'role': role_id})
+        await asyncio.to_thread(db_insert)
+
+    # This remains synchronous so it can be called safely via asyncio.to_thread where appropriate
     @classmethod
-    def clear_active(cls, event, user_id, types):
-        """
-        Marks a previously active tempmute as inactive for the given event/user.
-        This should be used in all locations where we either think this is no
-        longer active (e.g. the mute role was removed) _or_ when we don't want to
-        unmute the user any longer, e.g. they've been remuted by another command.
-        """
+    def clear_active(cls, ctx, user_id, types):
+        guild_id = getattr(ctx, 'guild_id', getattr(getattr(ctx, 'guild', None), 'id', None))
+        if not guild_id: return False
+        
         return cls.update(active=False).where(
-            (cls.guild_id == event.guild.id) &
+            (cls.guild_id == guild_id) &
             (cls.user_id == user_id) &
             (cls.type_ << types) &
             (cls.active == 1)
         ).execute() >= 1
+
 @BaseModel.register
 class StarboardBlock(BaseModel):
     guild_id = BigIntegerField()
     user_id = BigIntegerField()
     actor_id = BigIntegerField()
+
     class Meta:
+        db_table = 'starboard_blocks'
         indexes = (
             (('guild_id', 'user_id'), True),
         )
