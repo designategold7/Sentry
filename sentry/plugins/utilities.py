@@ -1,24 +1,20 @@
+import io
 import random
 import requests
 import humanize
 import operator
-import gevent
+import asyncio
 import functools
 from io import BytesIO
 from PIL import Image
 from peewee import fn
-from gevent.pool import Pool
 from datetime import datetime, timedelta, timezone
 from collections import defaultdict
-from disco.types.user import GameType, Status
-from disco.types.message import MessageEmbed
-from disco.util.snowflake import to_datetime
-from disco.util.sanitize import S
-from sentry.plugins import SentryPlugin as Plugin, CommandFail
-from sentry.util.timing import Eventual
+
+import discord
+from discord.ext import commands
+
 from sentry.util.input import parse_duration
-from sentry.util.gevent import wait_many
-from sentry.util.stats import statsd, to_tags
 from sentry.types.plugin import PluginConfig
 from sentry.models.guild import GuildVoiceSession
 from sentry.models.user import User, Infraction
@@ -28,271 +24,455 @@ from sentry.constants import (
     STATUS_EMOJI, SNOOZE_EMOJI, GREEN_TICK_EMOJI, GREEN_TICK_EMOJI_ID,
     EMOJI_RE, USER_MENTION_RE, YEAR_IN_SEC, CDN_URL
 )
-def get_status_emoji(presence):
-    if presence.game and presence.game.type == GameType.STREAMING:
-        return STATUS_EMOJI[GameType.STREAMING], 'Streaming'
-    elif presence.status == Status.ONLINE:
-        return STATUS_EMOJI[Status.ONLINE], 'Online'
-    elif presence.status == Status.IDLE:
-        return STATUS_EMOJI[Status.IDLE], 'Idle',
-    elif presence.status == Status.DND:
-        return STATUS_EMOJI[Status.DND], 'DND'
-    elif presence.status in (Status.OFFLINE, Status.INVISIBLE):
-        return STATUS_EMOJI[Status.OFFLINE], 'Offline'
-def get_emoji_url(emoji):
-    return CDN_URL.format('-'.join(char.encode("unicode_escape").decode("utf-8")[2:].lstrip("0") for char in emoji))
+
+def get_status_emoji(member):
+    if not member:
+        return STATUS_EMOJI[discord.Status.offline], 'Offline'
+        
+    activity = member.activity
+    if activity and activity.type == discord.ActivityType.streaming:
+        return STATUS_EMOJI['Streaming'], 'Streaming'
+    elif member.status == discord.Status.online:
+        return STATUS_EMOJI[discord.Status.online], 'Online'
+    elif member.status == discord.Status.idle:
+        return STATUS_EMOJI[discord.Status.idle], 'Idle'
+    elif member.status == discord.Status.dnd:
+        return STATUS_EMOJI[discord.Status.dnd], 'DND'
+    elif member.status in (discord.Status.offline, discord.Status.invisible):
+        return STATUS_EMOJI[discord.Status.offline], 'Offline'
+        
+    return STATUS_EMOJI[discord.Status.offline], 'Offline'
+
+def get_emoji_url(emoji_str):
+    return CDN_URL.format('-'.join(char.encode("unicode_escape").decode("utf-8")[2:].lstrip("0") for char in emoji_str))
+
 class UtilitiesConfig(PluginConfig):
     pass
-@Plugin.with_config(UtilitiesConfig)
-class UtilitiesPlugin(Plugin):
-    def load(self, ctx):
-        super(UtilitiesPlugin, self).load(ctx)
-        self.reminder_task = Eventual(self.trigger_reminders)
-        self.spawn_later(10, self.queue_reminders)
+
+class UtilitiesPlugin(commands.Cog):
+    def __init__(self, bot):
+        self.bot = bot
+        self.recalculate_event = asyncio.Event()
+        self.reminder_task = self.bot.loop.create_task(self.trigger_reminders_loop())
+        self.bot.loop.call_later(10, self.queue_reminders)
+
+    async def cog_unload(self):
+        self.reminder_task.cancel()
+
     def queue_reminders(self):
-        try:
-            next_reminder = Reminder.select().order_by(Reminder.remind_at.asc()).limit(1).get()
-        except Reminder.DoesNotExist:
-            return
-        self.reminder_task.set_next_schedule(next_reminder.remind_at)
-    @Plugin.command('coin', group='random', global_=True)
-    def coin(self, event):
-        event.msg.reply(random.choice(['heads', 'tails']))
-    @Plugin.command('number', '[end:int] [start:int]', group='random', global_=True)
-    def random_number(self, event, end=10, start=0):
+        self.recalculate_event.set()
+
+    @commands.command(name='coin')
+    async def cmd_coin(self, ctx):
+        await ctx.send(random.choice(['heads', 'tails']))
+
+    @commands.command(name='number')
+    async def cmd_random_number(self, ctx, end: int = 10, start: int = 0):
         if end > 9223372036854775807:
-            return event.msg.reply(':warning: ending number too big!')
+            return await ctx.send(':warning: ending number too big!')
         if end <= start:
-            return event.msg.reply(':warning: ending number must be larger than starting number!')
-        event.msg.reply(str(random.randint(start, end)))
-    @Plugin.command('cat', global_=True)
-    def cat(self, event):
-        for _ in range(3):
-            try:
-                r = requests.get('http://random.cat/meow')
-                r.raise_for_status()
-            except:
-                continue
-            url = r.json()['file']
-            if not url.endswith('.gif'):
-                break
-        else:
-            return event.msg.reply('404 cat not found :(')
-        r = requests.get(url)
-        r.raise_for_status()
-        event.msg.reply('', attachments=[('cat.jpg', r.content)])
-    @Plugin.command('emoji', '<emoji:str>', global_=True)
-    def emoji(self, event, emoji):
+            return await ctx.send(':warning: ending number must be larger than starting number!')
+        await ctx.send(str(random.randint(start, end)))
+
+    @commands.command(name='cat')
+    async def cmd_cat(self, ctx):
+        def fetch_cat():
+            for _ in range(3):
+                try:
+                    r = requests.get('http://random.cat/meow', timeout=5)
+                    r.raise_for_status()
+                    url = r.json()['file']
+                    if url.endswith(('.gif', '.jpg', '.png', '.jpeg')):
+                        img_req = requests.get(url, timeout=5)
+                        img_req.raise_for_status()
+                        return img_req.content
+                except Exception:
+                    continue
+            return None
+
+        content = await asyncio.to_thread(fetch_cat)
+        if not content:
+            return await ctx.send('404 cat not found :(')
+            
+        file = discord.File(BytesIO(content), filename='cat.jpg')
+        await ctx.send(file=file)
+
+    @commands.command(name='emoji')
+    async def cmd_emoji(self, ctx, emoji: str):
         if not EMOJI_RE.match(emoji):
-            return event.msg.reply('Unknown emoji: `{}`'.format(emoji))
+            return await ctx.send(f'Unknown emoji: `{emoji}`')
+            
         fields = []
         name, eid = EMOJI_RE.findall(emoji)[0]
-        fields.append('**ID:** {}'.format(eid))
-        fields.append('**Name:** {}'.format(S(name)))
-        guild = self.state.guilds.find_one(lambda v: eid in v.emojis)
+        fields.append(f'**ID:** {eid}')
+        fields.append(f'**Name:** {discord.utils.escape_markdown(name)}')
+        
+        # Searching all guilds the bot is in for the emoji
+        guild = discord.utils.find(lambda g: discord.utils.get(g.emojis, id=int(eid)) is not None, self.bot.guilds)
         if guild:
-            fields.append('**Guild:** {} ({})'.format(S(guild.name), guild.id))
-        url = 'https://discordapp.com/api/emojis/{}.png'.format(eid)
-        r = requests.get(url)
-        r.raise_for_status()
-        return event.msg.reply('\n'.join(fields), attachments=[('emoji.png', r.content)])
-    @Plugin.command('jumbo', '<emojis:str...>', global_=True)
-    def jumbo(self, event, emojis):
+            fields.append(f'**Guild:** {discord.utils.escape_markdown(guild.name)} ({guild.id})')
+            
+        url = f'https://cdn.discordapp.com/emojis/{eid}.png'
+        
+        def fetch_emoji_img():
+            r = requests.get(url, timeout=5)
+            r.raise_for_status()
+            return r.content
+
+        try:
+            img_data = await asyncio.to_thread(fetch_emoji_img)
+            file = discord.File(BytesIO(img_data), filename='emoji.png')
+            await ctx.send('\n'.join(fields), file=file)
+        except Exception:
+            await ctx.send('\n'.join(fields) + '\n\n*(Failed to download emoji image)*')
+
+    @commands.command(name='jumbo')
+    async def cmd_jumbo(self, ctx, *, emojis: str):
         urls = []
         for emoji in emojis.split(' ')[:5]:
             if EMOJI_RE.match(emoji):
                 _, eid = EMOJI_RE.findall(emoji)[0]
-                urls.append('https://discordapp.com/api/emojis/{}.png'.format(eid))
+                urls.append(f'https://cdn.discordapp.com/emojis/{eid}.png')
             else:
                 urls.append(get_emoji_url(emoji))
-        width, height, images = 0, 0, []
-        for r in Pool(6).imap(requests.get, urls):
+
+        def process_images(url_list):
+            width, height, images = 0, 0, []
+            for url in url_list:
+                try:
+                    r = requests.get(url, timeout=5)
+                    r.raise_for_status()
+                    img = Image.open(BytesIO(r.content)).convert("RGBA")
+                    height = img.height if img.height > height else height
+                    width += img.width + 10
+                    images.append(img)
+                except Exception:
+                    continue
+                    
+            if not images:
+                return None
+                
+            combined_image = Image.new('RGBA', (width, height))
+            width_offset = 0
+            for img in images:
+                combined_image.paste(img, (width_offset, 0))
+                width_offset += img.width + 10
+                
+            combined_bytes = BytesIO()
+            combined_image.save(combined_bytes, 'png', quality=55)
+            combined_bytes.seek(0)
+            return combined_bytes
+
+        combined = await asyncio.to_thread(process_images, urls)
+        if not combined:
+            return await ctx.send("Failed to parse those emojis.")
+            
+        file = discord.File(combined, filename='emoji.png')
+        await ctx.send(file=file)
+
+    @commands.command(name='seen')
+    async def cmd_seen(self, ctx, user: discord.User):
+        def fetch_last_seen():
+            query = Message.select(Message.timestamp).where(Message.author_id == user.id).order_by(Message.timestamp.desc()).limit(1)
             try:
-                r.raise_for_status()
-            except requests.HTTPError:
-                return
-            img = Image.open(BytesIO(r.content))
-            height = img.height if img.height > height else height
-            width += img.width + 10
-            images.append(img)
-        image = Image.new('RGBA', (width, height))
-        width_offset = 0
-        for img in images:
-            image.paste(img, (width_offset, 0))
-            width_offset += img.width + 10
-        combined = BytesIO()
-        image.save(combined, 'png', quality=55)
-        combined.seek(0)
-        return event.msg.reply('', attachments=[('emoji.png', combined)])
-    @Plugin.command('seen', '<user:user>', global_=True)
-    def seen(self, event, user):
-        query = Message.select(Message.timestamp).where(Message.author_id == user.id).order_by(Message.timestamp.desc()).limit(1)
-        try:
-            msg = getattr(query, 'async')().get()
-        except Message.DoesNotExist:
-            return event.msg.reply("I've never seen {}".format(user))
+                return query.get().timestamp
+            except Message.DoesNotExist:
+                return None
+
+        timestamp = await asyncio.to_thread(fetch_last_seen)
+        if not timestamp:
+            return await ctx.send(f"I've never seen {user}")
+            
         now = datetime.now(timezone.utc).replace(tzinfo=None)
-        event.msg.reply('I last saw {} {} ago (at {})'.format(user, humanize.naturaldelta(now - msg.timestamp), msg.timestamp))
-    @Plugin.command('search', '<query:str...>', global_=True)
-    def search(self, event, query):
-        queries = []
-        if query.isdigit():
-            queries.append((User.user_id == query))
-        q = USER_MENTION_RE.findall(query)
-        if len(q) and q[0].isdigit():
-            queries.append((User.user_id == q[0]))
-        else:
-            queries.append((User.username ** '%{}%'.format(query.replace('%', ''))))
-        if '#' in query:
-            username, discrim = query.rsplit('#', 1)
-            if discrim.isdigit():
-                queries.append(((User.username == username) & (User.discriminator == int(discrim))))
-        users = User.select().where(functools.reduce(operator.or_, queries))
+        await ctx.send(f'I last saw {user} {humanize.naturaldelta(now - timestamp)} ago (at {timestamp})')
+
+    @commands.command(name='search')
+    async def cmd_search(self, ctx, *, query: str):
+        def do_search():
+            queries = []
+            if query.isdigit():
+                queries.append((User.user_id == int(query)))
+                
+            q = USER_MENTION_RE.findall(query)
+            if len(q) and q[0].isdigit():
+                queries.append((User.user_id == int(q[0])))
+            else:
+                queries.append((User.username ** f'%{query.replace("%", "")}%'))
+                
+            if '#' in query:
+                try:
+                    username, discrim = query.rsplit('#', 1)
+                    if discrim.isdigit():
+                        queries.append(((User.username == username) & (User.discriminator == int(discrim))))
+                except ValueError:
+                    pass
+                    
+            return list(User.select().where(functools.reduce(operator.or_, queries)).limit(26))
+
+        users = await asyncio.to_thread(do_search)
+        
         if len(users) == 0:
-            return event.msg.reply('No users found for query `{}`'.format(S(query, escape_codeblocks=True)))
+            return await ctx.send(f'No users found for query `{discord.utils.escape_markdown(query)}`')
+            
         if len(users) == 1:
-            if users[0].user_id in self.state.users:
-                return self.info(event, self.state.users.get(users[0].user_id))
-        return event.msg.reply('Found the following users for your query: ```{}```'.format('\n'.join(map(lambda i: '{} ({})'.format(str(i), i.user_id), users[:25]))))
-    @Plugin.command('server', '[guild_id:snowflake]', global_=True)
-    def server(self, event, guild_id=None):
-        guild = self.state.guilds.get(guild_id) if guild_id else event.guild
+            member = ctx.guild.get_member(users[0].user_id) if ctx.guild else None
+            discord_user = member or self.bot.get_user(users[0].user_id)
+            if discord_user:
+                return await self.cmd_info(ctx, discord_user)
+                
+        user_lines = [f'{str(u)} ({u.user_id})' for u in users[:25]]
+        await ctx.send(f'Found the following users for your query: ```\n{"".join(user_lines)}\n```')
+
+    @commands.command(name='server')
+    async def cmd_server(self, ctx, guild_id: int = None):
+        guild = self.bot.get_guild(guild_id) if guild_id else ctx.guild
         if not guild:
-            raise CommandFail('invalid server')
+            return await ctx.send("Invalid server.")
+            
         content = []
         content.append('**\u276F Server Information**')
-        created_at = to_datetime(guild.id)
+        created_at = guild.created_at.replace(tzinfo=None)
         now = datetime.now(timezone.utc).replace(tzinfo=None)
-        content.append('Created: {} ago ({})'.format(humanize.naturaldelta(now - created_at), created_at.isoformat(),))
-        content.append('Members: {}'.format(len(guild.members)))
-        content.append('Features: {}'.format(', '.join(guild.features) or 'none'))
+        
+        content.append(f'Created: {humanize.naturaldelta(now - created_at)} ago ({created_at.isoformat()})')
+        content.append(f'Members: {guild.member_count}')
+        content.append(f'Features: {", ".join(guild.features) or "none"}')
+        
         content.append('\n**\u276F Counts**')
-        text_count = sum(1 for c in guild.channels.values() if not c.is_voice)
-        voice_count = len(guild.channels) - text_count
-        content.append('Roles: {}'.format(len(guild.roles)))
-        content.append('Text: {}'.format(text_count))
-        content.append('Voice: {}'.format(voice_count))
+        text_count = len(guild.text_channels)
+        voice_count = len(guild.voice_channels)
+        content.append(f'Roles: {len(guild.roles)}')
+        content.append(f'Text: {text_count}')
+        content.append(f'Voice: {voice_count}')
+        
         content.append('\n**\u276F Members**')
         status_counts = defaultdict(int)
-        for member in guild.members.values():
-            if not member.user.presence:
-                status = Status.OFFLINE
-            else:
-                status = member.user.presence.status
-            status_counts[status] += 1
+        for member in guild.members:
+            status_counts[member.status] += 1
+            
         for status, count in sorted(status_counts.items(), key=lambda i: str(i[0]), reverse=True):
-            content.append('<{}> - {}'.format(STATUS_EMOJI[status], count))
-        embed = MessageEmbed()
+            status_emoji = STATUS_EMOJI.get(status, STATUS_EMOJI.get('offline'))
+            content.append(f'<{status_emoji}> - {count}')
+            
+        embed = discord.Embed(description='\n'.join(content))
         if guild.icon:
-            embed.set_thumbnail(url=guild.icon_url)
-            embed.color = get_dominant_colors_guild(guild)
-        embed.description = '\n'.join(content)
-        event.msg.reply('', embed=embed)
-    @Plugin.command('info', '<user:user>')
-    def info(self, event, user):
+            embed.set_thumbnail(url=guild.icon.url)
+            
+        # Color processing mapped to thread
+        if guild.icon:
+            try:
+                color = await asyncio.to_thread(get_dominant_colors_guild, guild)
+                embed.color = color
+            except Exception:
+                pass
+                
+        await ctx.send(embed=embed)
+
+    @commands.command(name='info')
+    async def cmd_info(self, ctx, user: discord.User):
         content = []
         content.append('**\u276F User Information**')
-        content.append('ID: {}'.format(user.id))
-        content.append('Profile: <@{}>'.format(user.id))
-        if user.presence:
-            emoji, status = get_status_emoji(user.presence)
-            content.append('Status: {} <{}>'.format(status, emoji))
-            if user.presence.game and user.presence.game.name:
-                if user.presence.game.type == GameType.DEFAULT:
-                    content.append('Game: {}'.format(user.presence.game.name))
-                else:
-                    content.append('Stream: [{}]({})'.format(user.presence.game.name, user.presence.game.url))
-        created_dt = to_datetime(user.id)
+        content.append(f'ID: {user.id}')
+        content.append(f'Profile: <@{user.id}>')
+        
+        member = ctx.guild.get_member(user.id) if ctx.guild else None
+        
+        emoji, status = get_status_emoji(member)
+        content.append(f'Status: {status} <{emoji}>')
+        
+        if member and member.activity and member.activity.name:
+            if member.activity.type == discord.ActivityType.streaming:
+                content.append(f'Stream: [{member.activity.name}]({member.activity.url})')
+            else:
+                content.append(f'Game: {member.activity.name}')
+                
+        created_dt = user.created_at.replace(tzinfo=None)
         now = datetime.now(timezone.utc).replace(tzinfo=None)
-        content.append('Created: {} ago ({})'.format(humanize.naturaldelta(now - created_dt), created_dt.isoformat()))
-        member = event.guild.get_member(user.id) if event.guild else None
+        content.append(f'Created: {humanize.naturaldelta(now - created_dt)} ago ({created_dt.isoformat()})')
+        
         if member:
             content.append('\n**\u276F Member Information**')
             if member.nick:
-                content.append('Nickname: {}'.format(member.nick))
-            content.append('Joined: {} ago ({})'.format(humanize.naturaldelta(now - member.joined_at), member.joined_at.isoformat(),))
-            if member.roles:
-                content.append('Roles: {}'.format(', '.join((member.guild.roles.get(r).name for r in member.roles))))
-        newest_msg_query = Message.select(Message.timestamp).where((Message.author_id == user.id) & (Message.guild_id == event.guild.id)).limit(1).order_by(Message.timestamp.desc())
-        newest_msg = getattr(newest_msg_query, 'async')()
-        oldest_msg_query = Message.select(Message.timestamp).where((Message.author_id == user.id) & (Message.guild_id == event.guild.id)).limit(1).order_by(Message.timestamp.asc())
-        oldest_msg = getattr(oldest_msg_query, 'async')()
-        infractions_query = Infraction.select(Infraction.guild_id, fn.COUNT('*')).where((Infraction.user_id == user.id)).group_by(Infraction.guild_id).tuples()
-        infractions = getattr(infractions_query, 'async')()
-        voice_query = GuildVoiceSession.select(GuildVoiceSession.user_id, fn.COUNT('*'), fn.SUM(GuildVoiceSession.ended_at - GuildVoiceSession.started_at)).where((GuildVoiceSession.user_id == user.id) & (~(GuildVoiceSession.ended_at >> None))).group_by(GuildVoiceSession.user_id).tuples()
-        voice = getattr(voice_query, 'async')()
-        wait_many(newest_msg, oldest_msg, infractions, voice, timeout=10)
-        if newest_msg.value and oldest_msg.value:
-            new_val = newest_msg.value.get()
-            old_val = oldest_msg.value.get()
+                content.append(f'Nickname: {member.nick}')
+            if member.joined_at:
+                joined_dt = member.joined_at.replace(tzinfo=None)
+                content.append(f'Joined: {humanize.naturaldelta(now - joined_dt)} ago ({joined_dt.isoformat()})')
+            if member.roles[1:]: # Skip @everyone
+                content.append(f'Roles: {", ".join([r.name for r in member.roles[1:]])}')
+
+        def run_db_queries():
+            # Run all queries synchronously in the thread executor
+            newest_msg = Message.select(Message.timestamp).where((Message.author_id == user.id) & (Message.guild_id == ctx.guild.id)).limit(1).order_by(Message.timestamp.desc()).first()
+            oldest_msg = Message.select(Message.timestamp).where((Message.author_id == user.id) & (Message.guild_id == ctx.guild.id)).limit(1).order_by(Message.timestamp.asc()).first()
+            
+            infractions = list(Infraction.select(Infraction.guild_id, fn.COUNT('*')).where((Infraction.user_id == user.id)).group_by(Infraction.guild_id).tuples())
+            voice = list(GuildVoiceSession.select(GuildVoiceSession.user_id, fn.COUNT('*'), fn.SUM(GuildVoiceSession.ended_at - GuildVoiceSession.started_at)).where((GuildVoiceSession.user_id == user.id) & (~(GuildVoiceSession.ended_at >> None))).group_by(GuildVoiceSession.user_id).tuples())
+            
+            return newest_msg, oldest_msg, infractions, voice
+
+        newest_msg, oldest_msg, infractions, voice = await asyncio.to_thread(run_db_queries)
+
+        if newest_msg and oldest_msg:
             content.append('\n **\u276F Activity**')
-            content.append('Last Message: {} ago ({})'.format(humanize.naturaldelta(now - new_val.timestamp), new_val.timestamp.isoformat(),))
-            content.append('First Message: {} ago ({})'.format(humanize.naturaldelta(now - old_val.timestamp), old_val.timestamp.isoformat(),))
-        if infractions.value:
-            infractions_list = list(infractions.value)
-            total = sum(i[1] for i in infractions_list)
+            content.append(f'Last Message: {humanize.naturaldelta(now - newest_msg.timestamp)} ago ({newest_msg.timestamp.isoformat()})')
+            content.append(f'First Message: {humanize.naturaldelta(now - oldest_msg.timestamp)} ago ({oldest_msg.timestamp.isoformat()})')
+            
+        if infractions:
+            total = sum(i[1] for i in infractions)
             content.append('\n**\u276F Infractions**')
-            content.append('Total Infractions: {}'.format(total))
-            content.append('Unique Servers: {}'.format(len(infractions_list)))
-        if voice.value:
-            voice_list = list(voice.value)
+            content.append(f'Total Infractions: {total}')
+            content.append(f'Unique Servers: {len(infractions)}')
+            
+        if voice:
             content.append('\n**\u276F Voice**')
-            content.append('Sessions: {}'.format(voice_list[0][1]))
-            content.append('Time: {}'.format(humanize.naturaldelta(voice_list[0][2])))
-        embed = MessageEmbed()
-        avatar = 'https://cdn.discordapp.com/avatars/{}/{}.png'.format(user.id, user.avatar,)
-        embed.set_author(name='{}#{}'.format(user.username, user.discriminator,), icon_url=avatar)
-        embed.set_thumbnail(url=avatar)
-        embed.description = '\n'.join(content)
-        embed.color = get_dominant_colors_user(user, avatar)
-        event.msg.reply('', embed=embed)
-    def trigger_reminders(self):
-        now = datetime.now(timezone.utc).replace(tzinfo=None)
-        reminders = Reminder.with_message_join().where((Reminder.remind_at < (now + timedelta(seconds=1))))
-        waitables = []
-        for reminder in reminders:
-            waitables.append(self.spawn(self.trigger_reminder, reminder))
-        for waitable in waitables:
-            waitable.join()
-        self.queue_reminders()
-    def trigger_reminder(self, reminder):
-        message = reminder.message_id
-        channel = self.state.channels.get(message.channel_id)
-        if not channel:
-            reminder.delete_instance()
-            return
-        now = datetime.now(timezone.utc).replace(tzinfo=None)
-        msg = channel.send_message('<@{}> you asked me at {} ({} ago) to remind you about: {}'.format(message.author_id, reminder.created_at, humanize.naturaldelta(reminder.created_at - now), S(reminder.content)))
-        msg.add_reaction(SNOOZE_EMOJI)
-        msg.add_reaction(GREEN_TICK_EMOJI)
+            content.append(f'Sessions: {voice[0][1]}')
+            content.append(f'Time: {humanize.naturaldelta(voice[0][2])}')
+            
+        embed = discord.Embed(description='\n'.join(content))
+        
+        avatar_url = user.display_avatar.url
+        embed.set_author(name=str(user), icon_url=avatar_url)
+        embed.set_thumbnail(url=avatar_url)
+        
         try:
-            mra_event = self.wait_for_event('MessageReactionAdd', message_id=msg.id, conditional=lambda e: ((e.emoji.name == SNOOZE_EMOJI or e.emoji.id == GREEN_TICK_EMOJI_ID) and e.user_id == message.author_id)).get(timeout=30)
-        except gevent.Timeout:
-            reminder.delete_instance()
+            color = await asyncio.to_thread(get_dominant_colors_user, user, avatar_url)
+            embed.color = color
+        except Exception:
+            pass
+
+        await ctx.send(embed=embed)
+    async def trigger_reminders_loop(self):
+        await self.bot.wait_until_ready()
+        
+        while not self.bot.is_closed():
+            self.recalculate_event.clear()
+            
+            def get_next_reminder():
+                try:
+                    return Reminder.select().order_by(Reminder.remind_at.asc()).limit(1).get()
+                except Reminder.DoesNotExist:
+                    return None
+                    
+            next_reminder = await asyncio.to_thread(get_next_reminder)
+            
+            if not next_reminder:
+                # No reminders, sleep until woken up by a new addition
+                await self.recalculate_event.wait()
+                continue
+                
+            now = datetime.now(timezone.utc).replace(tzinfo=None)
+            
+            if next_reminder.remind_at > now:
+                sleep_seconds = (next_reminder.remind_at - now).total_seconds()
+                try:
+                    # Sleep until the next reminder, or until interrupted by a new one
+                    await asyncio.wait_for(self.recalculate_event.wait(), timeout=sleep_seconds)
+                    continue # Interrupted! Recalculate.
+                except asyncio.TimeoutError:
+                    pass # Timeout reached naturally, time to execute!
+
+            # Time to process due reminders
+            await self.trigger_reminders()
+
+    async def trigger_reminders(self):
+        now = datetime.now(timezone.utc).replace(tzinfo=None)
+        
+        def fetch_due_reminders():
+            return list(Reminder.with_message_join().where((Reminder.remind_at < (now + timedelta(seconds=1)))))
+            
+        reminders = await asyncio.to_thread(fetch_due_reminders)
+        
+        # Fire off all due reminders concurrently
+        tasks = [self.bot.loop.create_task(self.trigger_reminder(r)) for r in reminders]
+        if tasks:
+            await asyncio.gather(*tasks)
+            
+        # Re-queue to catch the next batch
+        self.queue_reminders()
+
+    async def trigger_reminder(self, reminder):
+        message = reminder.message_id
+        channel = self.bot.get_channel(message.channel_id)
+        if not channel:
+            await asyncio.to_thread(reminder.delete_instance)
+            return
+            
+        now = datetime.now(timezone.utc).replace(tzinfo=None)
+        time_ago = humanize.naturaldelta(reminder.created_at - now)
+        
+        try:
+            msg = await channel.send(f'<@{message.author_id}> you asked me at {reminder.created_at} ({time_ago} ago) to remind you about: {discord.utils.escape_markdown(reminder.content)}')
+            await msg.add_reaction(SNOOZE_EMOJI)
+            await msg.add_reaction(GREEN_TICK_EMOJI)
+        except discord.HTTPException:
+            await asyncio.to_thread(reminder.delete_instance)
+            return
+
+        def check(reaction, user):
+            return user.id == message.author_id and reaction.message.id == msg.id and \
+                   (str(reaction.emoji) == SNOOZE_EMOJI or (getattr(reaction.emoji, 'id', None) == GREEN_TICK_EMOJI_ID))
+
+        try:
+            reaction, user = await self.bot.wait_for('reaction_add', timeout=30.0, check=check)
+        except asyncio.TimeoutError:
+            await asyncio.to_thread(reminder.delete_instance)
             return
         finally:
-            msg.delete_reaction(SNOOZE_EMOJI)
-            msg.delete_reaction(GREEN_TICK_EMOJI)
-        now = datetime.now(timezone.utc).replace(tzinfo=None)
-        if mra_event.emoji.name == SNOOZE_EMOJI:
-            reminder.remind_at = now + timedelta(minutes=20)
-            reminder.save()
-            msg.edit('Ok, I\'ve snoozed that reminder for 20 minutes.')
+            try:
+                await msg.clear_reactions()
+            except discord.HTTPException:
+                pass
+
+        if str(reaction.emoji) == SNOOZE_EMOJI:
+            def snooze_db():
+                reminder.remind_at = datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(minutes=20)
+                reminder.save()
+            await asyncio.to_thread(snooze_db)
+            await msg.edit(content='Ok, I\'ve snoozed that reminder for 20 minutes.')
+            self.queue_reminders()
             return
-        reminder.delete_instance()
-    @Plugin.command('clear', group='r', global_=True)
-    def cmd_remind_clear(self, event):
-        count = Reminder.delete_for_user(event.author.id)
-        return event.msg.reply(':ok_hand: I cleared {} reminders for you'.format(count))
-    @Plugin.command('add', '<duration:str> <content:str...>', group='r', global_=True)
-    @Plugin.command('remind', '<duration:str> <content:str...>', global_=True)
-    def cmd_remind(self, event, duration, content):
-        if Reminder.count_for_user(event.author.id) > 30:
-            return event.msg.reply(':warning: you an only have 15 reminders going at once!')
+            
+        await asyncio.to_thread(reminder.delete_instance)
+
+    @commands.group(invoke_without_command=True, aliases=['r'])
+    async def remind(self, ctx):
+        pass
+
+    @remind.command(name='clear')
+    async def cmd_remind_clear(self, ctx):
+        count = await asyncio.to_thread(Reminder.delete_for_user, ctx.author.id)
+        return await ctx.send(f':ok_hand: I cleared {count} reminders for you')
+
+    @remind.command(name='add')
+    async def cmd_remind_add(self, ctx, duration: str, *, content: str):
+        # Fallback trigger logic to align with standard commands
+        await self._add_reminder(ctx, duration, content)
+
+    @commands.command(name='remind_standalone', aliases=['remind'])
+    async def cmd_remind_standalone(self, ctx, duration: str, *, content: str):
+        # Legacy route for !remind <duration> <content> instead of !r add
+        await self._add_reminder(ctx, duration, content)
+
+    async def _add_reminder(self, ctx, duration: str, content: str):
+        count = await asyncio.to_thread(Reminder.count_for_user, ctx.author.id)
+        if count > 30:
+            return await ctx.send(':warning: you can only have 15 reminders going at once!')
+            
         remind_at = parse_duration(duration)
         now = datetime.now(timezone.utc).replace(tzinfo=None)
+        
         if remind_at > (now + timedelta(seconds=5 * YEAR_IN_SEC)):
-            return event.msg.reply(':warning: thats too far in the future, I\'ll forget!')
-        r = Reminder.create(message_id=event.msg.id, remind_at=remind_at, content=content)
-        self.reminder_task.set_next_schedule(r.remind_at)
-        event.msg.reply(':ok_hand: I\'ll remind you at {} ({})'.format(r.remind_at.isoformat(), humanize.naturaldelta(r.remind_at - now),))
+            return await ctx.send(':warning: thats too far in the future, I\'ll forget!')
+            
+        def create_db_reminder():
+            return Reminder.create(message_id=ctx.message.id, remind_at=remind_at, content=content)
+            
+        r = await asyncio.to_thread(create_db_reminder)
+        
+        # Trigger the event to interrupt the loop and recalculate sleep
+        self.queue_reminders()
+        
+        await ctx.send(f':ok_hand: I\'ll remind you at {r.remind_at.isoformat()} ({humanize.naturaldelta(r.remind_at - now)})')
+
+async def setup(bot):
+    await bot.add_cog(UtilitiesPlugin(bot))
