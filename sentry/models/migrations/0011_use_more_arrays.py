@@ -1,17 +1,20 @@
 from sentry.models.migrations import Migrate
 from sentry.models.guild import GuildMemberBackup, GuildEmoji
+
 @Migrate.only_if(Migrate.missing, GuildEmoji, 'roles_new')
 def add_guild_emoji_columns(m):
     m.add_columns(
         GuildEmoji,
         GuildEmoji.roles_new,
     )
+
 @Migrate.only_if(Migrate.missing, GuildMemberBackup, 'roles_new')
 def add_guild_member_backup_columns(m):
     m.add_columns(
         GuildMemberBackup,
         GuildMemberBackup.roles_new
     )
+
 @Migrate.always()
 def backfill(m):
     m.backfill_column(
