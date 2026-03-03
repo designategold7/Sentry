@@ -1,84 +1,126 @@
 import time
+import asyncio
 from datadog import initialize, statsd
+
+import discord
+from discord.ext import commands
+
+# Sentry internal imports
 from sentry import ENV
-from sentry.plugins import BasePlugin as Plugin
+
 def to_tags(obj):
     return ['{}:{}'.format(k, v) for k, v in obj.items()]
-class StatsPlugin(Plugin):
-    global_plugin = True
-    def load(self, ctx):
-        super(StatsPlugin, self).load(ctx)
+
+class StatsPlugin(commands.Cog):
+    def __init__(self, bot):
+        self.bot = bot
+        
         if ENV == 'docker':
             initialize(statsd_host='statsd', statsd_port=8125)
         else:
             initialize(statsd_host='localhost', statsd_port=8125)
+            
         self.nonce = 0
         self.nonces = {}
-        self.unhooked_send_message = self.client.api.channels_messages_create
-        self.client.api.channels_messages_create = self.send_message_hook
-    def unload(self, ctx):
-        self.client.api.channels_messages_create = self.unhooked_send_message
-        super(StatsPlugin, self).unload(ctx)
-    def send_message_hook(self, *args, **kwargs):
+        
+        # Monkeypatch the discord.py HTTP client to inject nonces for latency tracking
+        self.unhooked_send_message = self.bot.http.send_message
+        self.bot.http.send_message = self.send_message_hook
+
+    async def cog_unload(self):
+        # Restore the original HTTP client method when the cog is unloaded
+        self.bot.http.send_message = self.unhooked_send_message
+
+    async def send_message_hook(self, channel_id, content, *args, **kwargs):
         self.nonce += 1
+        
+        # discord.py's send_message accepts a nonce kwarg
         kwargs['nonce'] = self.nonce
         self.nonces[self.nonce] = time.time()
-        return self.unhooked_send_message(*args, **kwargs)
-    @Plugin.listen('')
-    def on_gateway_event(self, event):
+        
+        return await self.unhooked_send_message(channel_id, content, *args, **kwargs)
+
+    @commands.Cog.listener()
+    async def on_socket_response(self, msg):
+        # msg is the raw dictionary from the Discord websocket
+        event_name = msg.get('t')
+        if not event_name:
+            return
+            
         metadata = {
-            'event': event.__class__.__name__,
+            'event': event_name,
         }
-        if hasattr(event, 'guild_id'):
-            metadata['guild_id'] = event.guild_id
-        elif hasattr(event, 'guild') and event.guild:
-            metadata['guild_id'] = event.guild.id
+        
+        data = msg.get('d')
+        if isinstance(data, dict):
+            guild_id = data.get('guild_id')
+            if guild_id:
+                metadata['guild_id'] = guild_id
+                
+        # statsd uses UDP, making it safe to fire synchronously without blocking the event loop
         statsd.increment('gateway.events.received', tags=to_tags(metadata))
-    @Plugin.listen('MessageCreate')
-    def on_message_create(self, event):
+
+    @commands.Cog.listener()
+    async def on_message(self, message):
         tags = {
-            'channel_id': event.channel_id,
-            'author_id': event.author.id,
+            'channel_id': message.channel.id,
+            'author_id': message.author.id,
         }
-        if event.guild:
-            tags['guild_id'] = event.guild.id
-        if event.author.id == self.client.state.me.id:
-            if event.nonce in self.nonces:
+        if message.guild:
+            tags['guild_id'] = message.guild.id
+            
+        if message.author.id == self.bot.user.id:
+            # message.nonce can occasionally be cast as a string by Discord's API
+            nonce = int(message.nonce) if message.nonce is not None and str(message.nonce).isdigit() else None
+            
+            if nonce in self.nonces:
                 statsd.timing(
                     'latency.message_send',
-                    time.time() - self.nonces[event.nonce],
+                    time.time() - self.nonces[nonce],
                     tags=to_tags(tags)
                 )
-                del self.nonces[event.nonce]
+                del self.nonces[nonce]
+                
         statsd.increment('guild.messages.create', tags=to_tags(tags))
-    @Plugin.listen('MessageUpdate')
-    def on_message_update(self, event):
+
+    @commands.Cog.listener()
+    async def on_message_edit(self, before, after):
         tags = {
-            'channel_id': event.channel_id,
-            'author_id': event.author.id,
+            'channel_id': after.channel.id,
+            'author_id': after.author.id,
         }
-        if event.guild:
-            tags['guild_id'] = event.guild.id
+        if after.guild:
+            tags['guild_id'] = after.guild.id
+            
         statsd.increment('guild.messages.update', tags=to_tags(tags))
-    @Plugin.listen('MessageDelete')
-    def on_message_delete(self, event):
+
+    @commands.Cog.listener()
+    async def on_message_delete(self, message):
         tags = {
-            'channel_id': event.channel_id,
+            'channel_id': message.channel.id,
         }
         statsd.increment('guild.messages.delete', tags=to_tags(tags))
-    @Plugin.listen('MessageReactionAdd')
-    def on_message_reaction_add(self, event):
-        statsd.increment('guild.messages.reactions.add', tags=to_tags({
-            'channel_id': event.channel_id,
-            'user_id': event.user_id,
-            'emoji_id': event.emoji.id,
-            'emoji_name': event.emoji.name,
-        }))
-    @Plugin.listen('MessageReactionRemove')
-    def on_message_reaction_remove(self, event):
-        statsd.increment('guild.messages.reactions.remove', tags=to_tags({
-            'channel_id': event.channel_id,
-            'user_id': event.user_id,
-            'emoji_id': event.emoji.id,
-            'emoji_name': event.emoji.name,
-        }))
+
+    @commands.Cog.listener()
+    async def on_raw_reaction_add(self, payload):
+        tags = {
+            'channel_id': payload.channel_id,
+            'user_id': payload.user_id,
+            'emoji_id': payload.emoji.id or '',
+            'emoji_name': payload.emoji.name or '',
+        }
+        statsd.increment('guild.messages.reactions.add', tags=to_tags(tags))
+
+    @commands.Cog.listener()
+    async def on_raw_reaction_remove(self, payload):
+        tags = {
+            'channel_id': payload.channel_id,
+            'user_id': payload.user_id,
+            'emoji_id': payload.emoji.id or '',
+            'emoji_name': payload.emoji.name or '',
+        }
+        statsd.increment('guild.messages.reactions.remove', tags=to_tags(tags))
+
+# Entry point for loading the cog via discord.py's extension system
+async def setup(bot):
+    await bot.add_cog(StatsPlugin(bot))
