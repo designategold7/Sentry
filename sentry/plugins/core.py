@@ -160,7 +160,6 @@ class CorePlugin(commands.Cog):
             if member:
                 await member.add_roles(sentry_role)
 
-    # d.py handles prefix routing locally, but we still need to attach configuration to context
     async def cog_check(self, ctx):
         if ctx.guild:
             guild_id = ctx.guild.id
@@ -168,10 +167,8 @@ class CorePlugin(commands.Cog):
             guild_id = None
 
         if guild_id not in self.guilds:
-            # Let global commands through in DMs if intended
             return True
 
-        # Sentry specific whitelist logic
         if hasattr(self, 'WHITELIST_FLAG'):
             whitelist = await asyncio.to_thread(lambda: self.guilds[guild_id].whitelist)
             if not int(self.WHITELIST_FLAG) in whitelist:
@@ -311,24 +308,6 @@ class CorePlugin(commands.Cog):
                 user_level = config.levels[member.id]
         return user_level
 
-    # Note: d.py handles command parsing naturally via on_message internally. 
-    # To mimic Sentry's strict level/override logic, we use a global check
-    @commands.Cog.listener()
-    async def on_message(self, message):
-        if message.author.bot:
-            return
-            
-        guild_id = message.guild.id if message.guild else None
-        
-        # Sentry's environment prefixing logic for testing
-        if ENV != 'prod' and not message.guild:
-            if not message.content.startswith(ENV + '!'):
-                return
-            message.content = message.content[len(ENV) + 1:]
-
-        # Custom ModLog tracking can be hooked here before processing commands
-        await self.bot.process_commands(message)
-
     @commands.command()
     async def setup(self, ctx):
         if not ctx.guild:
@@ -349,3 +328,161 @@ class CorePlugin(commands.Cog):
         await asyncio.to_thread(rdb.srem, GUILDS_WAITING_SETUP_KEY, str(ctx.guild.id))
         self.guilds[ctx.guild.id] = guild
         await ctx.send(':ok_hand: successfully loaded configuration')
+
+    @commands.command()
+    async def about(self, ctx):
+        embed = discord.Embed(description=BOT_INFO)
+        if self.bot.user.display_avatar:
+            embed.set_author(name='Sentry', icon_url=self.bot.user.display_avatar.url)
+        else:
+            embed.set_author(name='Sentry')
+            
+        guild_count = await asyncio.to_thread(lambda: Guild.select().count())
+        embed.add_field(name='Servers', value=str(guild_count), inline=True)
+        
+        uptime_delta = datetime.now(timezone.utc) - self.startup
+        embed.add_field(name='Uptime', value=humanize.naturaldelta(uptime_delta), inline=True)
+        
+        await ctx.send(embed=embed)
+
+    @commands.command()
+    async def uptime(self, ctx):
+        uptime_delta = datetime.now(timezone.utc) - self.startup
+        await ctx.send('Sentry was started {}'.format(humanize.naturaldelta(uptime_delta)))
+
+    @commands.command()
+    async def source(self, ctx, *, command_name: str = None):
+        if not command_name:
+            return await ctx.send("Please provide a command name.")
+            
+        cmd = self.bot.get_command(command_name)
+        if not cmd:
+            await ctx.send("Couldn't find command for `{}`".format(discord.utils.escape_markdown(command_name)))
+            return
+            
+        code = cmd.callback.__code__
+        lines, firstlineno = inspect.getsourcelines(code)
+        filename = os.path.basename(code.co_filename)
+        
+        await ctx.send('<https://github.com/designategold7/Sentry/blob/master/{}#L{}-{}>'.format(
+            filename, firstlineno, firstlineno + len(lines)
+        ))
+
+    @commands.command(name='eval')
+    async def _eval(self, ctx, *, codeblock: str):
+        src = codeblock.strip('` ')
+        if src.startswith('py\n'):
+            src = src[3:]
+
+        env = {
+            'bot': self.bot,
+            'client': self.bot,  
+            'state': self.bot,   
+            'ctx': ctx,
+            'msg': ctx.message,
+            'guild': ctx.guild,
+            'channel': ctx.channel,
+            'author': ctx.author
+        }
+        env.update(globals())
+
+        if '\n' in src:
+            lines = list(filter(bool, src.split('\n')))
+            if lines[-1] and 'return' not in lines[-1]:
+                lines[-1] = 'return ' + lines[-1]
+            lines = '\n'.join('    ' + i for i in lines)
+            code = 'async def f():\n{}'.format(lines)
+            local_env = {}
+            try:
+                exec(compile(code, '<eval>', 'exec'), env, local_env)
+                result_obj = await local_env['f']()
+                result = pprint.pformat(result_obj)
+            except Exception as e:
+                await ctx.send(PY_CODE_BLOCK.format(type(e).__name__ + ': ' + str(e)))
+                return
+        else:
+            try:
+                result = str(eval(src, env))
+            except Exception as e:
+                await ctx.send(PY_CODE_BLOCK.format(type(e).__name__ + ': ' + str(e)))
+                return
+
+        if len(result) > 1990:
+            import io
+            fp = io.BytesIO(result.encode('utf-8'))
+            await ctx.send(file=discord.File(fp, 'result.txt'))
+        else:
+            await ctx.send(PY_CODE_BLOCK.format(result))
+
+    @commands.group(invoke_without_command=True)
+    async def control(self, ctx):
+        pass
+
+    @control.command(name='sync-bans')
+    async def control_sync_bans(self, ctx):
+        def fetch_enabled_guilds():
+            return list(Guild.select().where(Guild.enabled == 1))
+            
+        guilds = await asyncio.to_thread(fetch_enabled_guilds)
+        msg = await ctx.send(':timer: pls wait while I sync...')
+        
+        for guild in guilds:
+            discord_guild = self.bot.get_guild(guild.guild_id)
+            if discord_guild:
+                await asyncio.to_thread(guild.sync_bans, discord_guild)
+                
+        await msg.edit(content='<:{}> synced {} guilds'.format(GREEN_TICK_EMOJI, len(guilds)))
+
+    @control.command(name='reconnect')
+    async def control_reconnect(self, ctx):
+        await ctx.send('Ok, closing connection')
+        await self.bot.close()
+
+    @commands.group(invoke_without_command=True)
+    async def guilds_group(self, ctx):
+        pass
+
+    @guilds_group.command(name='invite')
+    async def guild_join(self, ctx, guild_id: int):
+        guild = self.bot.get_guild(guild_id)
+        if not guild:
+            return await ctx.send(':no_entry_sign: invalid or unknown guild ID')
+            
+        msg = await ctx.send('Ok, hold on while I get you setup with an invite link to {}'.format(guild.name))
+        
+        general_channel = next((c for c in guild.text_channels if c.permissions_for(guild.me).create_instant_invite), None)
+        if not general_channel:
+            return await msg.edit(content=':no_entry_sign: I lack permissions to create an invite for {}'.format(guild.name))
+            
+        try:
+            invite = await general_channel.create_invite(max_age=300, max_uses=1, unique=True)
+        except Exception:
+            return await msg.edit(content=':no_entry_sign: Hmmm, something went wrong creating an invite for {}'.format(guild.name))
+            
+        await msg.edit(content='Ok, here is a temporary invite for you: {}'.format(invite.url))
+
+    @guilds_group.command(name='wh')
+    async def guild_whitelist(self, ctx, guild_id: int):
+        await asyncio.to_thread(rdb.sadd, GUILDS_WAITING_SETUP_KEY, str(guild_id))
+        await ctx.send('Ok, guild %s is now in the whitelist' % guild_id)
+
+    @guilds_group.command(name='unwh')
+    async def guild_unwhitelist(self, ctx, guild_id: int):
+        await asyncio.to_thread(rdb.srem, GUILDS_WAITING_SETUP_KEY, str(guild_id))
+        await ctx.send('Ok, I\'ve made sure guild %s is no longer in the whitelist' % guild_id)
+
+    @commands.group(invoke_without_command=True)
+    async def plugins(self, ctx):
+        pass
+
+    @plugins.command(name='disable')
+    async def plugin_disable(self, ctx, plugin_name: str):
+        if not self.bot.get_cog(plugin_name):
+            return await ctx.send('Hmmm, it appears that plugin doesn\'t exist!?')
+            
+        await self.bot.remove_cog(plugin_name)
+        await ctx.send('Ok, that plugin has been disabled and unloaded')
+
+
+async def setup(bot):
+    await bot.add_cog(CorePlugin(bot))
