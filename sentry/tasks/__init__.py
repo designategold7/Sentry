@@ -3,28 +3,43 @@ import uuid
 import logging
 import time
 import os
-import gevent
-from gevent.lock import Semaphore
+import asyncio
 from sentry.redis import rdb
+
 log = logging.getLogger(__name__)
 TASKS = {}
+
+_client_instance = None
+
 def get_client():
-    from disco.client import ClientConfig, Client
-    from sentry.config import token
-    config = ClientConfig()
-    config.token = token
-    return Client(config)
+    """
+    Returns a singleton discord.py client for REST-only operations.
+    This avoids opening/closing aiohttp sessions redundantly.
+    """
+    global _client_instance
+    if _client_instance is None:
+        import discord
+        from sentry.config import token
+        
+        # Instantiate without intent dependencies as this is a background worker
+        _client_instance = discord.Client(intents=discord.Intents.default())
+        # Pre-assign the token for HTTP routes
+        _client_instance.http.token = token
+        
+    return _client_instance
+
 def task(*args, **kwargs):
     """
-    Register a new task.
+    Register a new background task.
     """
     def deco(f):
-        task = Task(f.__name__, f, *args, **kwargs)
+        t = Task(f.__name__, f, *args, **kwargs)
         if f.__name__ in TASKS:
-            raise Exception("Conflicting task name: %s" % f.__name__)
-        TASKS[f.__name__] = task
-        return task
+            raise Exception(f"Conflicting task name: {f.__name__}")
+        TASKS[f.__name__] = t
+        return t
     return deco
+
 class Task(object):
     def __init__(self, name, method, max_concurrent=None, buffer_time=None, max_queue_size=25, global_lock=None):
         self.name = name
@@ -34,69 +49,100 @@ class Task(object):
         self.buffer_time = buffer_time
         self.global_lock = global_lock
         self.log = log
-    def __call__(self, *args, **kwargs):
-        return self.method(self, *args, **kwargs)
+
+    async def __call__(self, *args, **kwargs):
+        return await self.method(self, *args, **kwargs)
+
     def queue(self, *args, **kwargs):
-        # Make sure we have space
-        if self.max_queue_size and (rdb.llen('task_queue:%s' % self.name) or 0) > self.max_queue_size:
-            raise Exception("Queue for task %s is full!" % self.name)
+        # Determine current queue size safely
+        queue_size = rdb.llen(f'task_queue:{self.name}') or 0
+        if self.max_queue_size and queue_size > self.max_queue_size:
+            raise Exception(f"Queue for task {self.name} is full!")
+            
         task_id = str(uuid.uuid4())
-        rdb.rpush('task_queue:%s' % self.name, json.dumps({
+        rdb.rpush(f'task_queue:{self.name}', json.dumps({
             'id': task_id,
             'args': args,
             'kwargs': kwargs
         }))
         return task_id
+
 class TaskRunner(object):
-    def __init__(self, name, task):
+    def __init__(self, name, target_task):
         self.name = name
-        self.task = task
-        self.lock = Semaphore(task.max_concurrent)
-    def process(self, job):
+        self.task = target_task
+        self.lock = asyncio.Semaphore(target_task.max_concurrent) if target_task.max_concurrent else None
+
+    async def process(self, job):
         log.info('[%s] Running job %s...', job['id'], self.name)
         start = time.time()
         try:
-            self.task(*job['args'], **job['kwargs'])
+            await self.task(*job['args'], **job['kwargs'])
             if self.task.buffer_time:
-                time.sleep(self.task.buffer_time)
-        except:
+                await asyncio.sleep(self.task.buffer_time)
+        except Exception:
             log.exception('[%s] Failed in %ss', job['id'], time.time() - start)
+            
         log.info('[%s] Completed in %ss', job['id'], time.time() - start)
-    def run(self, job):
+
+    async def run(self, job):
         lock = None
         if self.task.global_lock:
-            lock = rdb.lock('{}:{}'.format(
+            lock_name = '{}:{}'.format(
                 self.task.name,
-                self.task.global_lock(
-                    *job['args'],
-                    **job['kwargs']
-                )
-            ))
-            lock.acquire()
-        if self.task.max_concurrent:
-            self.lock.acquire()
-        self.process(job)
-        if lock:
-            lock.release()
-        if self.task.max_concurrent:
-            self.lock.release()
+                self.task.global_lock(*job['args'], **job['kwargs'])
+            )
+            # Redis locks are blocking network IO
+            lock = await asyncio.to_thread(rdb.lock, lock_name)
+            await asyncio.to_thread(lock.acquire)
+
+        if self.lock:
+            await self.lock.acquire()
+
+        try:
+            await self.process(job)
+        finally:
+            if lock:
+                await asyncio.to_thread(lock.release)
+            if self.lock:
+                self.lock.release()
+
 class TaskWorker(object):
     def __init__(self):
         self.load()
-        self.queues = ['task_queue:' + i for i in TASKS.keys()]
+        self.queues = [f'task_queue:{i}' for i in TASKS.keys()]
         self.runners = {k: TaskRunner(k, v) for k, v in TASKS.items()}
         self.active = True
+
     def load(self):
         for f in os.listdir(os.path.dirname(os.path.abspath(__file__))):
             if f.endswith('.py') and not f.startswith('__'):
                 __import__('sentry.tasks.' + f.rsplit('.')[0])
-    def run(self):
+
+    async def run(self):
         log.info('Running TaskManager on %s queues...', len(self.queues))
+        
+        # Establish REST state for the singleton client
+        client = get_client()
+        await client.login(client.http.token)
+        
         while self.active:
-            chan, job = rdb.blpop(self.queues)
-            job_name = chan.split(':', 1)[1]
-            job = json.loads(job)
+            # Wrap the blocking Redis pop in a thread with a 1-second timeout
+            # to allow the asyncio event loop to breathe and handle shutdown signals.
+            result = await asyncio.to_thread(rdb.blpop, self.queues, 1)
+            
+            if not result:
+                continue
+                
+            chan, job_data = result
+            # Handle byte decoding from Redis
+            chan_str = chan.decode('utf-8') if isinstance(chan, bytes) else chan
+            job_name = chan_str.split(':', 1)[1]
+            job = json.loads(job_data)
+
             if job_name not in TASKS:
                 log.error("Cannot handle task %s", job_name)
                 continue
-            gevent.spawn(self.runners[job_name].run, job)
+
+            # Schedule the task concurrently
+            asyncio.create_task(self.runners[job_name].run(job))
