@@ -1,139 +1,155 @@
 import json
 import emoji
+import asyncio
 import requests
 from collections import defaultdict
+from html import unescape
+
+import discord
+from discord.ext import commands, tasks
+
 from holster.enum import Enum
-from disco.types.message import MessageEmbed
-from sentry.plugins import SentryPlugin as Plugin
 from sentry.redis import rdb
 from sentry.models.guild import Guild
 from sentry.types.plugin import PluginConfig
 from sentry.types import SlottedModel, DictField, Field, ChannelField
+
 FormatMode = Enum(
     'PLAIN',
     'PRETTY'
 )
+
 class SubRedditConfig(SlottedModel):
     channel = Field(ChannelField)
     mode = Field(FormatMode, default=FormatMode.PRETTY)
     nsfw = Field(bool, default=False)
     text_length = Field(int, default=256)
     include_stats = Field(bool, default=False)
+
 class RedditConfig(PluginConfig):
-    # TODO: validate they have less than 3 reddits selected
     subs = DictField(str, SubRedditConfig)
+
     def validate(self):
         if len(self.subs) > 3:
             raise Exception('Cannot have more than 3 subreddits configured')
-        # TODO: validate each subreddit
-@Plugin.with_config(RedditConfig)
-class RedditPlugin(Plugin):
-    @Plugin.schedule(30, init=False)
-    def check_subreddits(self):
-        # TODO: sharding
-        # TODO: filter in query
-        subs_raw = list(Guild.select(
-            Guild.guild_id,
-            Guild.config['plugins']['reddit']
-        ).where(
-            ~(Guild.config['plugins']['reddit'] >> None)
-        ).tuples())
-        # Group all subreddits, iterate, update channels
+
+class RedditPlugin(commands.Cog):
+    def __init__(self, bot):
+        self.bot = bot
+        self.check_subreddits.start()
+
+    async def cog_unload(self):
+        self.check_subreddits.cancel()
+
+    @tasks.loop(seconds=30)
+    async def check_subreddits(self):
+        def fetch_subs():
+            return list(Guild.select(
+                Guild.guild_id,
+                Guild.config['plugins']['reddit']
+            ).where(
+                ~(Guild.config['plugins']['reddit'] >> None)
+            ).tuples())
+
+        subs_raw = await asyncio.to_thread(fetch_subs)
+        
         subs = defaultdict(list)
         for gid, config in subs_raw:
-            config = json.loads(config)
-            for k, v in config['subs'].items():
-                subs[k].append((gid, SubRedditConfig(v)))
+            if isinstance(config, str):
+                config = json.loads(config)
+            
+            # Defensive check against bad config states
+            if 'subs' not in config:
+                continue
+                
+            for sub, sub_config in config['subs'].items():
+                subs[sub.lower()].append((gid, SubRedditConfig(sub_config)))
+
         for sub, configs in subs.items():
             try:
-                self.update_subreddit(sub, configs)
-            except requests.HTTPError:
-                self.log.exception('Error loading sub %s:', sub)
-    def get_channel(self, guild, ref):
-        # CLEAN THIS UP TO A RESOLVER
-        if isinstance(ref, int):
-            return guild.channels.get(ref)
-        else:
-            return guild.channels.select_one(name=ref)
-    def send_post(self, config, channel, data):
-        if config.mode is FormatMode.PLAIN:
-            channel.send_message('**{}**\n{}'.format(
-                data['title'],
-                'https://reddit.com{}'.format(data['permalink'])
-            ))
-        else:
-            embed = MessageEmbed()
-            if 'nsfw' in data and data['nsfw']:
-                if not config.nsfw:
-                    return
-                embed.color = 0xff6961
-            else:
-                embed.color = 0xaecfc8
-            # Limit title to 256 characters nicely
-            if len(data['title']) > 256:
-                embed.title = data['title'][:253] + '...'
-            else:
-                embed.title = data['title']
-            embed.url = 'https://reddit.com{}'.format(data['permalink'])
-            embed.set_author(
-                name=data['author'],
-                url='https://reddit.com/u/{}'.format(data['author'])
+                await self.check_subreddit(sub, configs)
+            except Exception as e:
+                print(f"Error checking subreddit {sub}: {e}")
+
+    @check_subreddits.before_loop
+    async def before_check_subreddits(self):
+        await self.bot.wait_until_ready()
+
+    async def check_subreddit(self, sub, configs):
+        def fetch_reddit():
+            r = requests.get(
+                f'https://www.reddit.com/r/{sub}/new.json?limit=15',
+                headers={'User-Agent': 'discord:Sentry:v0.0.1'}
             )
-            image = None
-            if data.get('media'):
-                if 'oembed' in data['media']:
-                    image = data['media']['oembed']['thumbnail_url']
-            elif data.get('preview'):
-                if 'images' in data['preview']:
-                    image = data['preview']['images'][0]['source']['url']
-            if 'selftext' in data and data['selftext']:
-                # TODO better place for validation
-                sz = min(64, max(config.text_length, 1900))
-                embed.description = data['selftext'][:sz]
-                if len(data['selftext']) > sz:
-                    embed.description += '...'
-                if image:
-                    embed.set_thumbnail(url=image)
-            elif image:
-                embed.set_image(url=image)
-            if config.include_stats:
-                embed.set_footer(text=emoji.emojize('{} upvotes | {} downvotes | {} comments'.format(
-                    data['ups'], data['downs'], data['num_comments']
-                )))
-            channel.send_message('', embed=embed)
-    def update_subreddit(self, sub, configs):
-        # TODO: use before on this request
-        r = requests.get(
-            'https://www.reddit.com/r/{}/new.json'.format(sub),
-            headers={
-                'User-Agent': 'discord:Sentry:v0.0.1'
-            }
-        )
-        r.raise_for_status()
-        data = list(reversed(list(map(lambda i: i['data'], r.json()['data']['children']))))
-        # TODO:
-        #  1. instead of tracking per guild, just track globally per subreddit
-        #  2. fan-out posts to each subscribed channel
+            r.raise_for_status()
+            return list(reversed(list(map(lambda i: i['data'], r.json()['data']['children']))))
+
+        try:
+            data = await asyncio.to_thread(fetch_reddit)
+        except Exception as e:
+            print(f"Failed to fetch Reddit data for {sub}: {e}")
+            return
+
         for gid, config in configs:
-            guild = self.state.guilds.get(gid)
+            guild = self.bot.get_guild(gid)
             if not guild:
-                self.log.warning('Skipping non existant guild %s', gid)
                 continue
-            channel = self.get_channel(guild, config.channel)
+
+            channel = guild.get_channel(config.channel)
             if not channel:
-                self.log.warning('Skipping non existant channel %s for guild %s (%s)', channel, guild.name, gid)
                 continue
-            last = float(rdb.get('rdt:lpid:{}:{}'.format(channel.id, sub)) or 0)
+
+            def get_last_id():
+                return float(rdb.get(f'rdt:lpid:{channel.id}:{sub}') or 0)
+
+            last = await asyncio.to_thread(get_last_id)
             item_count, high_time = 0, last
+
             for item in data:
                 if item['created_utc'] > last:
                     try:
-                        self.send_post(config, channel, item)
-                    except:
-                        self.log.exception('Failed to post reddit content from %s\n\n', item)
+                        await self.send_post(config, channel, item)
+                    except Exception as e:
+                        print(f'Failed to post reddit content from {item}: {e}')
+                        
                     item_count += 1
+                    
                     if item['created_utc'] > high_time:
-                        rdb.set('rdt:lpid:{}:{}'.format(channel.id, sub), item['created_utc'])
+                        await asyncio.to_thread(rdb.set, f'rdt:lpid:{channel.id}:{sub}', item['created_utc'])
                         high_time = item['created_utc']
-                if item_count > 10:
-                    break
+
+    async def send_post(self, config, channel, item):
+        if not config.nsfw and item['over_18']:
+            return
+
+        if config.mode == FormatMode.PLAIN:
+            content = f"**{item['title']}**\n<{item['url']}>"
+            await channel.send(content)
+            return
+
+        embed = discord.Embed()
+        embed.title = item['title'][:256]
+        embed.url = f"https://reddit.com{item['permalink']}"
+        embed.color = 0xFF5700 # Reddit Orange
+        
+        embed.set_author(name=f"Posted by u/{item['author']}", url=f"https://reddit.com/u/{item['author']}")
+
+        if item.get('selftext'):
+            text = unescape(item['selftext'])
+            if len(text) > config.text_length:
+                text = text[:config.text_length] + '...'
+            embed.description = text
+
+        if config.include_stats:
+            embed.add_field(name='Score', value=str(item['score']), inline=True)
+            embed.add_field(name='Comments', value=str(item['num_comments']), inline=True)
+
+        if item.get('post_hint') == 'image' and item.get('url'):
+            embed.set_image(url=item['url'])
+        elif item.get('thumbnail') and item['thumbnail'] not in ('self', 'default', 'nsfw', 'spoiler'):
+            embed.set_thumbnail(url=item['thumbnail'])
+
+        await channel.send(embed=embed)
+
+async def setup(bot):
+    await bot.add_cog(RedditPlugin(bot))
