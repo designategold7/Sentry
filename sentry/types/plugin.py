@@ -1,8 +1,11 @@
 from sentry.types import SlottedModel
+
 class PluginConfig(SlottedModel):
     def load(self, obj, *args, **kwargs):
-        obj = {
+        if not obj: obj = {}
+        # Pre-filter fields and drop any marked private before sending up the Model chain
+        obj_filtered = {
             k: v for k, v in obj.items()
-            if k in self._fields and not self._fields[k].metadata.get('private')
+            if k in self._fields and not getattr(self._fields[k], 'private', False)
         }
-        return super(PluginConfig, self).load(obj, *args, **kwargs)
+        return super(PluginConfig, self).load(obj_filtered, *args, **kwargs)
