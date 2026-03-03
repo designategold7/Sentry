@@ -1,4 +1,5 @@
 import yaml
 with open('config.yaml', 'r') as f:
-    loaded = yaml.load(f.read())
+    # Security patch: Upgraded from yaml.load to yaml.safe_load
+    loaded = yaml.safe_load(f.read())
     locals().update(loaded)
