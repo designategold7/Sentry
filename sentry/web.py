@@ -3,11 +3,13 @@ os.environ['OAUTHLIB_INSECURE_TRANSPORT'] = '1'
 import logging
 from flask import Flask, g, session
 from holster.flask_ext import Holster
+from yaml import safe_load  
+
 from sentry import ENV
 from sentry.sql import init_db
 from sentry.models.user import User
 from sentry.types.guild import PluginsConfig
-from yaml import safe_load  
+
 raw_app = Flask(__name__)
 raw_app.logger_name = raw_app.name
 sentry_app = Holster(raw_app)
@@ -15,19 +17,21 @@ sentry_app = Holster(raw_app)
 
 logging.getLogger('peewee').setLevel(logging.DEBUG)
 
-@sentry_app.app.before_first_request
-def before_first_request():
-    init_db(ENV)
-    PluginsConfig.force_load_plugin_configs()
-    with open('config.yaml', 'r') as f:
-        data = safe_load(f) 
-    
-    web_config = data.get('web', {})
-    sentry_app.app.config.update(web_config)
-    
- 
-    sentry_app.app.secret_key = web_config.get('SECRET_KEY', 'sentry_default_secret_key_8675309')
-    sentry_app.app.config['token'] = data.get('token')
+# Flask 2.3+ deprecated before_first_request, but maintaining structure for compatibility
+@sentry_app.app.before_request
+def setup_once():
+    if not getattr(sentry_app.app, '_got_first_request', False):
+        init_db(ENV)
+        PluginsConfig.force_load_plugin_configs()
+        with open('config.yaml', 'r') as f:
+            data = safe_load(f) 
+        
+        web_config = data.get('web', {})
+        sentry_app.app.config.update(web_config)
+        
+        sentry_app.app.secret_key = web_config.get('SECRET_KEY', 'sentry_default_secret_key_8675309')
+        sentry_app.app.config['token'] = data.get('token')
+        sentry_app.app._got_first_request = True
 
 @sentry_app.app.before_request
 def check_auth():
