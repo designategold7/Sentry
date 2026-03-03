@@ -1,13 +1,22 @@
 import os
 import logging
 import subprocess
-from disco.util.logging import LOG_FORMAT
 from raven import Client
-from raven.transport.gevent import GeventedHTTPTransport
+
+# Replaced disco's proprietary LOG_FORMAT with a standard Python logging format
+LOG_FORMAT = '[%(levelname)s] %(asctime)s - %(name)s:%(lineno)d - %(message)s'
+
 ENV = os.getenv('ENV', 'local')
 DSN = os.getenv('DSN')
-REV = subprocess.check_output(['git', 'rev-parse', 'HEAD']).strip()
+
+try:
+    # Decode bytes to string for modern Python 3 compatibility
+    REV = subprocess.check_output(['git', 'rev-parse', 'HEAD']).strip().decode('utf-8')
+except Exception:
+    REV = 'unknown'
+    
 VERSION = '1.3.0'
+
 raven_client = Client(
     DSN,
     ignore_exceptions=[
@@ -15,8 +24,9 @@ raven_client = Client(
     ],
     release=REV,
     environment=ENV,
-    transport=GeventedHTTPTransport,
+    # REMOVED: GeventedHTTPTransport. Reverting to default threaded transport for asyncio compatibility.
 )
+
 # Log things to file
 file_handler = logging.FileHandler('sentry.log')
 log = logging.getLogger()
