@@ -8,7 +8,6 @@ services:
     volumes:
       - ./.data:/var/lib/postgresql/data
     restart: always
-
   redis:
     image: redis:3.2
     command: redis-server --appendonly yes
@@ -17,7 +16,6 @@ services:
     ports:
       - "6379:6379"
     restart: always
-
   web:
     build: .
     command: python manage.py serve -r
@@ -29,7 +27,6 @@ services:
       - db
       - redis
     restart: always
-
   frontend:
     build: ./frontend/
     environment:
@@ -44,7 +41,6 @@ services:
     depends_on:
       - web
     restart: always
-
   bot:
     build: .
     command: python manage.py bot -e docker
@@ -55,7 +51,6 @@ services:
     depends_on:
       - web
     restart: always
-
   workers:
     build: .
     command: python manage.py workers
