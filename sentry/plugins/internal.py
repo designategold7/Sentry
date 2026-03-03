@@ -1,169 +1,172 @@
-import gevent
-from gevent.lock import Semaphore
+import asyncio
 from datetime import datetime, timedelta, timezone
-
-from peewee import fn
-from disco.gateway.packets import OPCode, RECV
-from disco.types.message import MessageTable, MessageEmbed
-
-# SENTRY REBRANDING: Updated from rowboat to sentry
+import discord
+from discord.ext import commands, tasks
 from sentry.redis import rdb
-from sentry.plugins import BasePlugin as Plugin
 from sentry.util.redis import RedisSet
 from sentry.models.event import Event
 from sentry.models.user import User
 from sentry.models.channel import Channel
 from sentry.models.message import Command, Message
 
+# Utility replacement for disco's MessageTable
+class MessageTable:
+    def __init__(self, codeblock=True):
+        self.headers = []
+        self.rows = []
+        self.codeblock = codeblock
 
-class InternalPlugin(Plugin):
-    global_plugin = True
+    def set_header(self, *args):
+        self.headers = [str(arg) for arg in args]
 
-    def load(self, ctx):
-        super(InternalPlugin, self).load(ctx)
+    def add(self, *args):
+        self.rows.append([str(arg) for arg in args])
 
+    def compile(self):
+        if not self.headers and not self.rows:
+            return ""
+        
+        col_widths = [len(h) for h in self.headers]
+        for row in self.rows:
+            for i, col in enumerate(row):
+                if len(col) > col_widths[i]:
+                    col_widths[i] = len(col)
+                    
+        header_row = " | ".join(h.ljust(w) for h, w in zip(self.headers, col_widths))
+        separator = "-+-".join("-" * w for w in col_widths)
+        
+        lines = [header_row, separator]
+        for row in self.rows:
+            lines.append(" | ".join(c.ljust(w) for c, w in zip(row, col_widths)))
+            
+        res = "\n".join(lines)
+        if self.codeblock:
+            return "```\n" + res + "\n```"
+        return res
+
+class InternalPlugin(commands.Cog):
+    def __init__(self, bot):
+        self.bot = bot
         self.events = RedisSet(rdb, 'internal:tracked-events')
         self.session_id = None
-        self.lock = Semaphore()
+        self.lock = asyncio.Lock()
         self.cache = []
+        self.flush_cache.start()
+        self.prune_old_events.start()
 
-    @Plugin.command('errors', group='commands', level=-1)
-    def on_commands_errors(self, event):
-        q = Command.select().join(
-            Message, on=(Command.message_id == Message.id)
-        ).where(
-            Command.success == 0
-        ).order_by(Message.timestamp.desc()).limit(10)
+    async def cog_unload(self):
+        self.flush_cache.cancel()
+        self.prune_old_events.cancel()
+
+    def is_admin(self, ctx):
+        core = self.bot.get_cog('CorePlugin')
+        if not core: return False
+        return core.get_level(ctx.guild.id, ctx.author) >= 100
+
+    @commands.group(invoke_without_command=True)
+    async def commands(self, ctx):
+        pass
+
+    @commands.command(name='errors')
+    async def on_commands_errors(self, ctx):
+        if not self.is_admin(ctx): return await ctx.send("Invalid permissions.")
+        
+        def fetch_errors():
+            q = Command.select().join(
+                Message, on=(Command.message_id == Message.id)
+            ).where(
+                Command.success == 0
+            ).order_by(Message.timestamp.desc()).limit(10)
+            return list(q)
+
+        errors = await asyncio.to_thread(fetch_errors)
 
         tbl = MessageTable()
         tbl.set_header('ID', 'Command', 'Error')
 
-        for err in q:
-            # Python 3: Replaced u'' with standard f-strings or .format()
-            tbl.add(err.message_id, '{}.{}'.format(err.plugin, err.command), err.traceback.split('\n')[-2])
+        for err in errors:
+            tbl.add(err.message_id, f"{err.plugin}.{err.command}", err.traceback.split('\n')[-2])
 
-        event.msg.reply(tbl.compile())
+        await ctx.send(tbl.compile())
 
-    @Plugin.command('info', '<mid:snowflake>', group='commands', level=-1)
-    def on_commands_info(self, event, mid):
-        cmd = Command.select(Command, Message, Channel).join(
-            Message, on=(Command.message_id == Message.id).alias('message')
-        ).join(
-            Channel, on=(Channel.channel_id == Message.channel_id).alias('channel')
-        ).join(
-            User, on=(User.user_id == Message.author_id).alias('author')
-        ).where(
-            Command.message_id == mid
-        ).order_by(
-            Message.timestamp.desc(),
-        ).get()
+    @commands.group(invoke_without_command=True)
+    async def events(self, ctx):
+        pass
 
-        embed = MessageEmbed()
-        embed.title = '{}.{} ({})'.format(cmd.plugin, cmd.command, cmd.message.id)
+    @events.command(name='add')
+    async def on_events_add(self, ctx, name: str):
+        if not self.is_admin(ctx): return await ctx.send("Invalid permissions.")
         
-        # Python 3: Replaced unicode() with str()
-        embed.set_author(name=str(cmd.message.author), icon_url=cmd.message.author.get_avatar_url())
-        embed.color = 0x77dd77 if cmd.success else 0xff6961
+        await asyncio.to_thread(self.events.add, name)
+        await ctx.send(f':ok_hand: added {name} to the list of tracked events')
 
-        if not cmd.success:
-            embed.description = '```{}```'.format(cmd.traceback)
+    @events.command(name='remove')
+    async def on_events_remove(self, ctx, name: str):
+        if not self.is_admin(ctx): return await ctx.send("Invalid permissions.")
+        
+        await asyncio.to_thread(self.events.remove, name)
+        await ctx.send(f':ok_hand: removed {name} from the list of tracked events')
 
-        embed.add_field(name='Message', value=cmd.message.content)
-        embed.add_field(name='Channel', value='{} `{}`'.format(cmd.message.channel.name, cmd.message.channel.channel_id))
-        embed.add_field(name='Guild', value=str(cmd.message.guild_id))
-        event.msg.reply(embed=embed)
+    @tasks.loop(seconds=300)
+    async def prune_old_events(self):
+        def do_prune():
+            now = datetime.now(timezone.utc).replace(tzinfo=None)
+            Event.delete().where(
+                (Event.timestamp > now - timedelta(hours=24))
+            ).execute()
+            
+        await asyncio.to_thread(do_prune)
 
-    @Plugin.command('usage', group='commands', level=-1)
-    def on_commands_usage(self, event):
-        q = Command.select(
-            fn.COUNT('*'),
-            Command.plugin,
-            Command.command,
-        ).group_by(
-            Command.plugin, Command.command
-        ).order_by(fn.COUNT('*').desc()).limit(25)
+    @prune_old_events.before_loop
+    async def before_prune(self):
+        await self.bot.wait_until_ready()
 
-        tbl = MessageTable()
-        tbl.set_header('Plugin', 'Command', 'Usage')
-
-        for count, plugin, command in q.tuples():
-            tbl.add(plugin, command, count)
-
-        event.msg.reply(tbl.compile())
-
-    @Plugin.command('stats', '<name:str>', group='commands', level=-1)
-    def on_commands_stats(self, event, name):
-        if '.' in name:
-            plugin, command = name.split('.', 1)
-            q = (
-                (Command.plugin == plugin) &
-                (Command.command == command)
-            )
-        else:
-            q = (Command.command == name)
-
-        result = list(Command.select(
-            fn.COUNT('*'),
-            Command.success,
-        ).where(q).group_by(Command.success).order_by(fn.COUNT('*').desc()).tuples())
-
-        success, error = 0, 0
-        for count, check in result:
-            if check:
-                success = count
-            else:
-                error = count
-
-        event.msg.reply('Command `{}` was used a total of {} times, {} of those had errors'.format(
-            name,
-            success + error,
-            error
-        ))
-
-    @Plugin.command('throw', level=-1)
-    def on_throw(self, event):
-        raise Exception('Internal.throw')
-
-    @Plugin.command('add', '<name:str>', group='events', level=-1)
-    def on_events_add(self, event, name):
-        self.events.add(name)
-        event.msg.reply(':ok_hand: added {} to the list of tracked events'.format(name))
-
-    @Plugin.command('remove', '<name:str>', group='events', level=-1)
-    def on_events_remove(self, event, name):
-        self.events.remove(name)
-        event.msg.reply(':ok_hand: removed {} from the list of tracked events'.format(name))
-
-    @Plugin.schedule(300, init=False)
-    def prune_old_events(self):
-        # Python 3.12 Modernization: Replaced utcnow()
-        now = datetime.now(timezone.utc).replace(tzinfo=None)
-        Event.delete().where(
-            (Event.timestamp > now - timedelta(hours=24))
-        ).execute()
-
-    @Plugin.listen('Ready')
-    def on_ready(self, event):
-        self.session_id = event.session_id
-        gevent.spawn(self.flush_cache)
-
-    @Plugin.listen_packet((RECV, OPCode.DISPATCH))
-    def on_gateway_event(self, event):
-        if event['t'] not in self.events:
+    @commands.Cog.listener()
+    async def on_ready(self):
+        self.session_id = self.bot.ws.session_id if getattr(self.bot, 'ws', None) else "UNKNOWN_SESSION"
+    @commands.Cog.listener()
+    async def on_socket_response(self, msg):
+        # Equivalent to catching OPCode.DISPATCH
+        if msg.get('op') != 0:
+            return
+            
+        event_name = msg.get('t')
+        if not event_name:
             return
 
-        with self.lock:
-            self.cache.append(event)
+        tracked_events = await asyncio.to_thread(lambda: list(self.events))
 
-    def flush_cache(self):
-        while True:
-            gevent.sleep(1)
+        if event_name not in tracked_events:
+            return
 
-            if not len(self.cache):
-                continue
+        async with self.lock:
+            self.cache.append(msg)
 
-            with self.lock:
-                Event.insert_many(list(filter(bool, [
-                    Event.prepare(self.session_id, event) for event in self.cache
-                ]))).execute()
-                self.cache = []
+    @tasks.loop(seconds=1)
+    async def flush_cache(self):
+        async with self.lock:
+            if not self.cache:
+                return
+                
+            # Pop all items from the current cache
+            items = self.cache
+            self.cache = []
+
+        def execute_flush(batch):
+            events_to_insert = [
+                {
+                    'event': item['t'],
+                    'content': item['d'],
+                    'session_id': self.session_id
+                } for item in batch
+            ]
+            Event.insert_many(events_to_insert).execute()
+
+        await asyncio.to_thread(execute_flush, items)
+
+    @flush_cache.before_loop
+    async def before_flush_cache(self):
+        await self.bot.wait_until_ready()
+
+async def setup(bot):
+    await bot.add_cog(InternalPlugin(bot))
