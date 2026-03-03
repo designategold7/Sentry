@@ -2,18 +2,22 @@ import re
 import json
 import uuid
 import traceback
+import asyncio
 from peewee import (
     BigIntegerField, ForeignKeyField, TextField, DateTimeField,
     BooleanField, UUIDField
 )
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from playhouse.postgres_ext import BinaryJSONField, ArrayField
-from disco.types.base import UNSET
+
+# Sentry internal imports
 from sentry import REV
 from sentry.util import default_json
 from sentry.models.user import User
 from sentry.sql import BaseModel
+
 EMOJI_RE = re.compile(r'<:.+:([0-9]+)>')
+
 @BaseModel.register
 class Message(BaseModel):
     id = BigIntegerField(primary_key=True)
@@ -30,6 +34,7 @@ class Message(BaseModel):
     emojis = ArrayField(BigIntegerField, default=[], null=True)
     attachments = ArrayField(TextField, default=[], null=True)
     embeds = BinaryJSONField(default=[], null=True)
+    
     SQL = '''
         CREATE INDEX\
                 IF NOT EXISTS messages_content_fts ON messages USING gin(to_tsvector('english', content));
@@ -39,82 +44,96 @@ class Message(BaseModel):
     class Meta:
         db_table = 'messages'
         indexes = (
-            # These indexes are mostly just general use
             (('channel_id', ), False),
             (('guild_id', ), False),
             (('deleted', ), False),
-            # Timestamp is regularly sorted on
             (('timestamp', ), False),
-            # Some queries want to get history in a guild or channel
             (('author', 'guild_id', 'channel_id'), False),
         )
+
     @classmethod
     def from_disco_message_update(cls, obj):
-        if not obj.edited_timestamp:
+        if not getattr(obj, 'edited_at', None):
             return
+            
         to_update = {
-            'edited_timestamp': obj.edited_timestamp,
+            'edited_timestamp': obj.edited_at.replace(tzinfo=None),
             'num_edits': cls.num_edits + 1,
-            'mentions': list(obj.mentions.keys()),
+            'mentions': [u.id for u in obj.mentions],
         }
-        if obj.content is not UNSET:
-            to_update['content'] = obj.with_proper_mentions
-            to_update['emojis'] = list(map(int, EMOJI_RE.findall(obj.content)))
-        if obj.attachments is not UNSET:
-            to_update['attachments'] = [i.url for i in obj.attachments.values()]
-        if obj.embeds is not UNSET:
-            to_update['embeds'] = [json.dumps(i.to_dict(), default=default_json) for i in obj.embeds]
+        
+        if hasattr(obj, 'content'):
+            # d.py clean_content resolves mentions nicely
+            to_update['content'] = obj.clean_content 
+            to_update['emojis'] = [int(e) for e in EMOJI_RE.findall(obj.content)]
+            
+        if hasattr(obj, 'attachments'):
+            to_update['attachments'] = [a.url for a in obj.attachments]
+            
+        if hasattr(obj, 'embeds'):
+            to_update['embeds'] = [json.dumps(e.to_dict(), default=default_json) for e in obj.embeds]
+            
         cls.update(**to_update).where(cls.id == obj.id).execute()
+
     @classmethod
     def from_disco_message(cls, obj):
+        guild_id = obj.guild.id if getattr(obj, 'guild', None) else None
+        
         _, created = cls.get_or_create(
             id=obj.id,
             defaults=dict(
-                channel_id=obj.channel_id,
-                guild_id=(obj.guild and obj.guild.id),
+                channel_id=obj.channel.id,
+                guild_id=guild_id,
                 author=User.from_disco_user(obj.author),
-                content=obj.with_proper_mentions,
-                timestamp=obj.timestamp,
-                edited_timestamp=obj.edited_timestamp,
-                num_edits=(0 if not obj.edited_timestamp else 1),
-                mentions=list(obj.mentions.keys()),
-                emojis=list(map(int, EMOJI_RE.findall(obj.content))),
-                attachments=[i.url for i in obj.attachments.values()],
-                embeds=[json.dumps(i.to_dict(), default=default_json) for i in obj.embeds]))
-        for user in obj.mentions.values():
+                content=obj.clean_content,
+                timestamp=obj.created_at.replace(tzinfo=None),
+                edited_timestamp=obj.edited_at.replace(tzinfo=None) if obj.edited_at else None,
+                num_edits=(0 if not obj.edited_at else 1),
+                mentions=[u.id for u in obj.mentions],
+                emojis=[int(e) for e in EMOJI_RE.findall(obj.content)],
+                attachments=[a.url for a in obj.attachments],
+                embeds=[json.dumps(e.to_dict(), default=default_json) for e in obj.embeds]))
+                
+        for user in obj.mentions:
             User.from_disco_user(user)
         return created
+
     @classmethod
     def from_disco_message_many(cls, messages, safe=False):
         q = cls.insert_many(map(cls.convert_message, messages)).returning(cls.id)
         if safe:
             q = q.on_conflict('DO NOTHING')
         return q.execute()
+
     @staticmethod
     def convert_message(obj):
+        guild_id = obj.guild.id if getattr(obj, 'guild', None) else None
         return {
             'id': obj.id,
-            'channel_id': obj.channel_id,
-            'guild_id': (obj.guild and obj.guild.id),
+            'channel_id': obj.channel.id,
+            'guild_id': guild_id,
             'author': User.from_disco_user(obj.author),
-            'content': obj.with_proper_mentions,
-            'timestamp': obj.timestamp,
-            'edited_timestamp': obj.edited_timestamp,
-            'num_edits': (0 if not obj.edited_timestamp else 1),
-            'mentions': list(obj.mentions.keys()),
-            'emojis': list(map(int, EMOJI_RE.findall(obj.content))),
-            'attachments': [i.url for i in obj.attachments.values()],
-            'embeds': [json.dumps(i.to_dict(), default=default_json) for i in obj.embeds],
+            'content': obj.clean_content,
+            'timestamp': obj.created_at.replace(tzinfo=None),
+            'edited_timestamp': obj.edited_at.replace(tzinfo=None) if obj.edited_at else None,
+            'num_edits': (0 if not obj.edited_at else 1),
+            'mentions': [u.id for u in obj.mentions],
+            'emojis': [int(e) for e in EMOJI_RE.findall(obj.content)],
+            'attachments': [a.url for a in obj.attachments],
+            'embeds': [json.dumps(e.to_dict(), default=default_json) for e in obj.embeds],
         }
+
     @classmethod
     def for_channel(cls, channel):
         return cls.select().where(cls.channel_id == channel.id)
+
 @BaseModel.register
 class Reaction(BaseModel):
     message_id = BigIntegerField()
     user_id = BigIntegerField()
     emoji_id = BigIntegerField(null=True)
     emoji_name = TextField()
+    
     class Meta:
         db_table = 'reactions'
         indexes = (
@@ -122,47 +141,57 @@ class Reaction(BaseModel):
             (('user_id', ), False),
             (('emoji_name', 'emoji_id', ), False),
         )
+
     @classmethod
     def from_disco_reactors(cls, message_id, reaction, user_ids):
+        emoji_id = getattr(reaction.emoji, 'id', None)
+        emoji_name = getattr(reaction.emoji, 'name', str(reaction.emoji))
+        
         cls.insert_many([
             {
                 'message_id': message_id,
                 'user_id': i,
-                'emoji_id': reaction.emoji.id or None,
-                'emoji_name': reaction.emoji.name or None
+                'emoji_id': emoji_id,
+                'emoji_name': emoji_name
             } for i in user_ids
         ]).on_conflict('DO NOTHING').execute()
+
     @classmethod
-    def from_disco_reaction(cls, obj):
+    def from_disco_reaction(cls, payload):
         return cls.create(
-            message_id=obj.message_id,
-            user_id=obj.user_id,
-            emoji_id=obj.emoji.id or None,
-            emoji_name=obj.emoji.name or None)
+            message_id=payload.message_id,
+            user_id=payload.user_id,
+            emoji_id=payload.emoji.id or None,
+            emoji_name=payload.emoji.name or str(payload.emoji))
+
 @BaseModel.register
 class MessageArchive(BaseModel):
     FORMATS = ['txt', 'csv', 'json']
     archive_id = UUIDField(primary_key=True, default=uuid.uuid4)
     message_ids = BinaryJSONField()
-    created_at = DateTimeField(default=datetime.utcnow)
-    expires_at = DateTimeField(default=lambda: datetime.utcnow() + timedelta(days=7))
+    created_at = DateTimeField(default=lambda: datetime.now(timezone.utc).replace(tzinfo=None))
+    expires_at = DateTimeField(default=lambda: datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(days=7))
+    
     class Meta:
         db_table = 'message_archives'
         indexes = (
             (('created_at', ), False),
             (('expires_at', ), False)
         )
+
     @classmethod
     def create_from_message_ids(cls, message_ids):
         return cls.create(message_ids=message_ids)
+
     @property
     def url(self):
-        # TODO: use web endpoint here
-        return 'https://dashboard.sentry.party/api/archive/{}.txt'.format(self.archive_id)
+        return f'https://dashboard.sentry.party/api/archive/{self.archive_id}.txt'
+
     def encode(self, fmt='txt'):
         from sentry.models.user import User
         if fmt not in self.FORMATS:
-            raise Exception('Invalid format {}'.format(fmt))
+            raise Exception(f'Invalid format {fmt}')
+            
         q = Message.select(
             Message.id,
             Message.channel_id,
@@ -176,6 +205,7 @@ class MessageArchive(BaseModel):
         ).where(
             (Message.id << self.message_ids)
         )
+        
         if fmt == 'txt':
             return '\n'.join(map(self.encode_message_text, q))
         elif fmt == 'csv':
@@ -186,10 +216,12 @@ class MessageArchive(BaseModel):
             return json.dumps({
                 'messages': list(map(self.encode_message_json, q))
             })
+
     @staticmethod
     def encode_message_text(msg):
-        return '{m.timestamp} ({m.id} / {m.channel_id} / {m.author.id}) {m.author}: {m.content} ({attach})'.format(
-            m=msg, attach=', '.join(map(str, msg.attachments or [])))
+        attach = ', '.join(map(str, msg.attachments or []))
+        return f'{msg.timestamp} ({msg.id} / {msg.channel_id} / {msg.author.id}) {msg.author}: {msg.content} ({attach})'
+
     @staticmethod
     def encode_message_csv(msg):
         def wrap(i):
@@ -203,6 +235,7 @@ class MessageArchive(BaseModel):
             str(msg.deleted).lower(),
             ' '.join(msg.attachments or [])
         ]))
+
     @staticmethod
     def encode_message_json(msg):
         return dict(
@@ -214,18 +247,17 @@ class MessageArchive(BaseModel):
             content=msg.content,
             deleted=msg.deleted,
             attachments=msg.attachments)
+
 @BaseModel.register
 class StarboardEntry(BaseModel):
     message = ForeignKeyField(Message, primary_key=True)
-    # Information on where this starboard message lies
     star_channel_id = BigIntegerField(null=True)
     star_message_id = BigIntegerField(null=True)
-    # List of user ids who stared this message, not guarenteed to be accurate
     stars = ArrayField(BigIntegerField, default=[])
-    # List of user ids who starred this message, but are blocked
     blocked_stars = ArrayField(BigIntegerField, default=[])
     blocked = BooleanField(default=False)
     dirty = BooleanField(default=False)
+    
     SQL = '''
         CREATE INDEX\
                 IF NOT EXISTS starboard_entries_stars ON starboard_entries USING gin (stars);
@@ -235,6 +267,7 @@ class StarboardEntry(BaseModel):
         indexes = (
             (('star_channel_id', 'star_message_id'), True),
         )
+
     @classmethod
     def add_star(cls, message_id, user_id):
         sql = '''
@@ -246,6 +279,7 @@ class StarboardEntry(BaseModel):
                 WHERE NOT starboard_entries.stars @> ARRAY[%s]
             '''
         cls.raw(sql, message_id, user_id, user_id, user_id).execute()
+
     @classmethod
     def remove_star(cls, message_id, user_id):
         sql = '''
@@ -257,6 +291,7 @@ class StarboardEntry(BaseModel):
                 WHERE message_id=%s AND starboard_entries.stars @> ARRAY[%s]
         '''
         cls.raw(sql, user_id, user_id, message_id, user_id).execute()
+
     @classmethod
     def block_user(cls, user_id):
         sql = '''
@@ -275,6 +310,7 @@ class StarboardEntry(BaseModel):
                 )
             ))
         ).execute()
+
     @classmethod
     def unblock_user(cls, user_id):
         sql = '''
@@ -295,14 +331,17 @@ class StarboardEntry(BaseModel):
                 )
             )) & (StarboardEntry.blocked == 1)
         ).execute()
+
 @BaseModel.register
 class Reminder(BaseModel):
     message_id = BigIntegerField(primary_key=True)
-    created_at = DateTimeField(default=datetime.utcnow)
+    created_at = DateTimeField(default=lambda: datetime.now(timezone.utc).replace(tzinfo=None))
     remind_at = DateTimeField()
     content = TextField()
+    
     class Meta:
         db_table = 'reminders'
+
     @classmethod
     def with_message_join(cls, fields=None):
         return cls.select(
@@ -310,11 +349,13 @@ class Reminder(BaseModel):
         ).join(Message, on=(
             Reminder.message_id == Message.id
         ))
+
     @classmethod
     def count_for_user(cls, user_id):
         return cls.with_message_join().where(
             (Message.author_id == user_id)
         ).count()
+
     @classmethod
     def delete_for_user(cls, user_id):
         return cls.delete().where(
@@ -322,6 +363,7 @@ class Reminder(BaseModel):
                 Message.author_id == user_id
             ))
         ).execute()
+
 @BaseModel.register
 class Command(BaseModel):
     message_id = BigIntegerField(primary_key=True)
@@ -330,18 +372,24 @@ class Command(BaseModel):
     version = TextField()
     success = BooleanField()
     traceback = TextField(null=True)
+    
     class Meta:
         db_table = 'commands'
         indexes = (
             (('success', ), False),
             (('plugin', 'command'), False),
         )
+
     @classmethod
-    def track(cls, event, command, exception=False):
+    def track(cls, ctx, exception=False):
+        # Adapted for discord.py's Context object
+        cog_name = ctx.cog.qualified_name if ctx.cog else 'NoPlugin'
+        command_name = ctx.command.qualified_name if ctx.command else 'Unknown'
+        
         return cls.create(
-            message_id=event.message.id,
-            plugin=command.plugin.name,
-            command=command.name,
+            message_id=ctx.message.id,
+            plugin=cog_name,
+            command=command_name,
             version=REV,
             success=not exception,
             traceback=traceback.format_exc() if exception else None,
