@@ -1,5 +1,4 @@
 #!/usr/bin/env python
-from gevent import monkey; monkey.patch_all()
 import flask
 if not hasattr(flask.Flask, 'before_first_request'):
     def before_first_request(self, f):
@@ -7,46 +6,18 @@ if not hasattr(flask.Flask, 'before_first_request'):
         return f
     flask.Flask.before_first_request = before_first_request
 import os
-import copy
 import click
-import signal
 import logging
-import gevent
-import subprocess
+import asyncio
+import yaml
+import discord
+from discord.ext import commands
 from werkzeug.serving import run_simple
 from sentry import ENV
 from sentry.web import sentry_app
 from sentry.sql import init_db
-class BotSupervisor(object):
-    def __init__(self, env={}):
-        self.proc = None
-        self.env = env
-        self.bind_signals()
-        self.start()
-    def bind_signals(self):
-        signal.signal(signal.SIGUSR1, self.handle_sigusr1)
-    def handle_sigusr1(self, signum, frame):
-        print('SIGUSR1 - RESTARTING')
-        gevent.spawn(self.restart)
-    def start(self):
-        env = copy.deepcopy(os.environ)
-        env.update(self.env)
-        self.proc = subprocess.Popen(['python', '-m', 'disco.cli', '--config', 'config.yaml'], env=env)
-    def stop(self):
-        self.proc.terminate()
-    def restart(self):
-        try:
-            self.stop()
-        except:
-            pass
-        self.start()
-    def run_forever(self):
-        while True:
-            self.proc.wait()
-            gevent.sleep(5)
 @click.group()
-def cli():
-    logging.getLogger().setLevel(logging.INFO)
+def cli(): logging.getLogger().setLevel(logging.INFO)
 @cli.command()
 @click.option('--reloader/--no-reloader', '-r', default=False)
 def serve(reloader):
@@ -56,13 +27,24 @@ def serve(reloader):
 @click.option('--env', '-e', default='local')
 def bot(env):
     init_db(env)
-    BotSupervisor(env={'ENV': env}).run_forever()
+    with open('config.yaml', 'r') as f: config = yaml.safe_load(f)
+    intents = discord.Intents.default()
+    intents.message_content = True
+    intents.members = True
+    intents.presences = True
+    client = commands.Bot(command_prefix='!', intents=intents)
+    async def main():
+        async with client:
+            for f in os.listdir('sentry/plugins'):
+                if f.endswith('.py') and not f.startswith('__'): await client.load_extension(f'sentry.plugins.{f[:-3]}')
+            await client.start(config['token'])
+    asyncio.run(main())
 @cli.command()
 def workers():
     from sentry.tasks import TaskWorker
     logging.getLogger('peewee').setLevel(logging.INFO)
     init_db(ENV)
-    TaskWorker().run()
+    asyncio.run(TaskWorker().run())
 @cli.command('add-global-admin')
 @click.argument('user-id')
 def add_global_admin(user_id):
@@ -71,6 +53,5 @@ def add_global_admin(user_id):
     init_db(ENV)
     rdb.sadd('global_admins', user_id)
     User.update(admin=True).where(User.user_id == user_id).execute()
-    print('Ok, added {} as a global admin'.format(user_id))
-if __name__ == '__main__':
-    cli()
+    print(f'Ok, added {user_id} as a global admin')
+if __name__ == '__main__': cli()
