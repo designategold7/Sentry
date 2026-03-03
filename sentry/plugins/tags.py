@@ -1,100 +1,157 @@
+import asyncio
 
-from disco.bot import CommandLevels
-from disco.util.sanitize import S
-from disco.types.message import MessageEmbed
-
-from rowboat.plugins import RowboatPlugin as Plugin, CommandFail, CommandSuccess
-from rowboat.types import Field
-from rowboat.types.plugin import PluginConfig
-from rowboat.models.tags import Tag
-from rowboat.models.user import User
-
+import discord
+from discord.ext import commands
+from sentry.types import Field
+from sentry.types.plugin import PluginConfig
+from sentry.models.tags import Tag
+from sentry.models.user import User
 
 class TagsConfig(PluginConfig):
     max_tag_length = Field(int)
-    min_level_remove_others = Field(int, default=int(CommandLevels.MOD))
+    # Sentry command levels: 50 is MOD, 10 is TRUSTED
+    min_level_remove_others = Field(int, default=50)
 
+class TagsPlugin(commands.Cog):
+    def __init__(self, bot):
+        self.bot = bot
 
-@Plugin.with_config(TagsConfig)
-class TagsPlugin(Plugin):
-    @Plugin.command('create', '<name:str> <content:str...>', group='tags', aliases=['add'], level=CommandLevels.TRUSTED)
-    def on_tags_create(self, event, name, content):
-        name = S(name)
-        content = S(content)
+    def get_level(self, ctx):
+        core = self.bot.get_cog('CorePlugin')
+        if not core: return 0
+        return core.get_level(ctx.guild.id, ctx.author)
 
-        if len(content) > event.config.max_tag_length:
-            raise CommandFail('tag content is too long (max {} characters)'.format(event.config.max_tag_length))
+    def is_trusted(self, ctx):
+        return self.get_level(ctx) >= 10
 
-        _, created = Tag.get_or_create(
-            guild_id=event.guild.id,
-            author_id=event.author.id,
-            name=name,
-            content=content
-        )
+    @commands.group(invoke_without_command=True, aliases=['tag'])
+    async def tags(self, ctx, name: str = None):
+        if not name:
+            return
+        await self.on_tags_show(ctx, name)
+
+    @tags.command(name='create', aliases=['add'])
+    async def on_tags_create(self, ctx, name: str, *, content: str):
+        if not self.is_trusted(ctx): return await ctx.send("Invalid permissions.")
+        
+        name = discord.utils.escape_markdown(name)
+        content = discord.utils.escape_markdown(content)
+
+        config = getattr(ctx, 'base_config', None)
+        max_len = config.plugins.tags.max_tag_length if config and hasattr(config.plugins, 'tags') else 2000
+
+        if len(content) > max_len:
+            return await ctx.send(f':warning: tag content is too long (max {max_len} characters)')
+
+        def db_create_tag():
+            return Tag.get_or_create(
+                guild_id=ctx.guild.id,
+                author_id=ctx.author.id,
+                name=name,
+                content=content
+            )
+
+        _, created = await asyncio.to_thread(db_create_tag)
 
         if not created:
-            raise CommandFail('a tag by that name already exists')
+            return await ctx.send(':warning: a tag by that name already exists')
 
-        raise CommandSuccess(u'ok, your tag named `{}` has been created'.format(name))
+        await ctx.send(f':ok_hand: ok, your tag named `{name}` has been created')
 
-    @Plugin.command('tags', '<name:str>', aliases=['tag'], level=CommandLevels.TRUSTED)
-    @Plugin.command('show', '<name:str>', group='tags', level=CommandLevels.TRUSTED)
-    def on_tags(self, event, name):
-        try:
-            tag = Tag.select(Tag, User).join(
-                User, on=(User.user_id == Tag.author_id)
-            ).where(
-                (Tag.guild_id == event.guild.id) &
-                (Tag.name == S(name))
-            ).get()
-        except Tag.DoesNotExist:
-            raise CommandFail('no tag by that name exists')
+    @tags.command(name='show')
+    async def on_tags_show(self, ctx, name: str):
+        # We don't necessarily enforce TRUSTED to simply view a tag, but preserving Sentry logic
+        if not self.is_trusted(ctx): return await ctx.send("Invalid permissions.")
+        
+        safe_name = discord.utils.escape_markdown(name)
 
-        # Track the usage of the tag
-        Tag.update(times_used=Tag.times_used + 1).where(
-            (Tag.guild_id == tag.guild_id) &
-            (Tag.name == tag.name)
-        ).execute()
+        def fetch_and_update_tag():
+            try:
+                tag = Tag.select(Tag, User).join(
+                    User, on=(User.user_id == Tag.author_id)
+                ).where(
+                    (Tag.guild_id == ctx.guild.id) &
+                    (Tag.name == safe_name)
+                ).get()
+                
+                Tag.update(times_used=Tag.times_used + 1).where(
+                    (Tag.guild_id == tag.guild_id) &
+                    (Tag.name == tag.name)
+                ).execute()
+                
+                return tag
+            except Tag.DoesNotExist:
+                return None
 
-        event.msg.reply(u':information_source: {}'.format(
-            tag.content
-        ))
+        tag = await asyncio.to_thread(fetch_and_update_tag)
+        
+        if not tag:
+            return await ctx.send(':warning: no tag by that name exists')
 
-    @Plugin.command('remove', '<name:str>', group='tags', aliases=['del', 'rm'], level=CommandLevels.TRUSTED)
-    def on_tags_remove(self, event, name):
-        try:
-            tag = Tag.select(Tag, User).join(
-                User, on=(User.user_id == Tag.author_id)
-            ).where(
-                (Tag.guild_id == event.guild.id) &
-                (Tag.name == S(name))
-            ).get()
-        except Tag.DoesNotExist:
-            raise CommandFail('no tag by that name exists')
+        await ctx.send(f':information_source: {tag.content}')
 
-        if tag.author_id != event.author.id:
-            if event.user_level <= event.config.min_level_remove_others:
-                raise CommandFail('you do not have the required permissions to remove other users tags')
+    @tags.command(name='remove', aliases=['del', 'rm'])
+    async def on_tags_remove(self, ctx, name: str):
+        if not self.is_trusted(ctx): return await ctx.send("Invalid permissions.")
+        
+        safe_name = discord.utils.escape_markdown(name)
 
-        tag.delete_instance()
-        raise CommandSuccess(u'ok, deleted tag `{}`'.format(tag.name))
+        def fetch_tag_for_deletion():
+            try:
+                return Tag.select(Tag, User).join(
+                    User, on=(User.user_id == Tag.author_id)
+                ).where(
+                    (Tag.guild_id == ctx.guild.id) &
+                    (Tag.name == safe_name)
+                ).get()
+            except Tag.DoesNotExist:
+                return None
 
-    @Plugin.command('info', '<name:str>', group='tags', level=CommandLevels.TRUSTED)
-    def on_tags_info(self, event, name):
-        try:
-            tag = Tag.select(Tag, User).join(
-                User, on=(User.user_id == Tag.author_id).alias('author')
-            ).where(
-                (Tag.guild_id == event.guild.id) &
-                (Tag.name == S(name))
-            ).get()
-        except Tag.DoesNotExist:
-            raise CommandFail('no tag by that name exists')
+        tag = await asyncio.to_thread(fetch_tag_for_deletion)
+        if not tag:
+            return await ctx.send(':warning: no tag by that name exists')
 
-        embed = MessageEmbed()
+        config = getattr(ctx, 'base_config', None)
+        min_level = config.plugins.tags.min_level_remove_others if config and hasattr(config.plugins, 'tags') else 50
+
+        if tag.author_id != ctx.author.id:
+            if self.get_level(ctx) < min_level:
+                return await ctx.send(':warning: you do not have the required permissions to remove other users tags')
+
+        await asyncio.to_thread(tag.delete_instance)
+        await ctx.send(f':ok_hand: ok, deleted tag `{tag.name}`')
+
+    @tags.command(name='info')
+    async def on_tags_info(self, ctx, name: str):
+        if not self.is_trusted(ctx): return await ctx.send("Invalid permissions.")
+        
+        safe_name = discord.utils.escape_markdown(name)
+
+        def fetch_tag():
+            try:
+                return Tag.select(Tag, User).join(
+                    User, on=(User.user_id == Tag.author_id).alias('author')
+                ).where(
+                    (Tag.guild_id == ctx.guild.id) &
+                    (Tag.name == safe_name)
+                ).get()
+            except Tag.DoesNotExist:
+                return None
+
+        tag = await asyncio.to_thread(fetch_tag)
+        if not tag:
+            return await ctx.send(':warning: no tag by that name exists')
+
+        embed = discord.Embed()
         embed.title = tag.name
         embed.description = tag.content
-        embed.add_field(name='Author', value=unicode(tag.author), inline=True)
+        embed.add_field(name='Author', value=str(tag.author), inline=True)
         embed.add_field(name='Times Used', value=str(tag.times_used), inline=True)
-        embed.timestamp = tag.created_at.isoformat()
-        event.msg.reply(embed=embed)
+        
+        # Datetimes from Peewee are usually naive UTC, replace for d.py compatibility
+        embed.timestamp = tag.created_at.replace(tzinfo=timezone.utc) if tag.created_at else discord.Embed.Empty
+        
+        await ctx.send(embed=embed)
+
+async def setup(bot):
+    await bot.add_cog(TagsPlugin(bot))
