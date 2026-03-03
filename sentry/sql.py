@@ -8,10 +8,12 @@ database = PostgresqlExtDatabase(None)
 
 class BaseModel(Model):
     REGISTERED_MODELS = {}
+    
     @classmethod
     def register(cls, model_cls):
         cls.REGISTERED_MODELS[model_cls.__name__.lower()] = model_cls
         return model_cls
+        
     class Meta:
         database = database
 
@@ -22,17 +24,16 @@ def init_db(env_name_unused):
     with open(config_path, 'r') as f:
         config = yaml.safe_load(f)
     
-    # Direct mapping to user's 'database' root key
     db_config = config.get('database')
     if not db_config:
         raise KeyError(f"Critical: 'database' block missing from root of {config_path}")
     
     database.init(
-        db_config['name'],  # User's YAML uses 'name' for the DB name
+        db_config['name'],
         host=db_config['host'],
         port=int(db_config.get('port', 5432)),
         user=db_config['user'],
-        password=db_config.get('password', '')  # Safe fallback for missing password
+        password=db_config.get('password', '')
     )
     
     retries = 0
