@@ -12,12 +12,5 @@ def users_me_guilds():
     if g.user.admin:
         guilds = list(Guild.select())
     else:
-        guilds = list(Guild.select(
-            Guild,
-            Guild.config['web'][str(g.user.user_id)].alias('role')
-        ).where(
-            (~(Guild.config['web'][str(g.user.user_id)] >> None))
-        ))
-    return jsonify([
-        guild.serialize() for guild in guilds
-    ])
+        guilds = list(Guild.select(Guild, Guild.config['web'][str(g.user.user_id)].alias('role')).where((~(Guild.config['web'][str(g.user.user_id)] >> None))))
+    return jsonify([guild.serialize() for guild in guilds])
