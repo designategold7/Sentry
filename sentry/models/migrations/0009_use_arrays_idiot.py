@@ -2,6 +2,7 @@ import time
 from sentry.models.migrations import Migrate
 from sentry.models.message import Message
 from sentry.sql import database as db
+
 def backfill_column(table, old_columns, new_columns):
     total = table.select().count()
     q = table.select(
@@ -11,22 +12,27 @@ def backfill_column(table, old_columns, new_columns):
     idx = 0
     modified = 0
     start = time.time()
+    
     with db.transaction() as txn:
         for values in q:
             idx += 1
             if idx % 10000 == 0:
-                print('[%ss] Backfilling %s %s/%s (wrote %s)' % (time.time() - start, str(table), idx, total, modified))
-            if modified % 1000:
+                print(f'[{time.time() - start}s] Backfilling {str(table)} {idx}/{total} (wrote {modified})')
+            if modified % 1000 == 0:
                 txn.commit()
+                
             obj = {new_column.name: values[i + 1] for i, new_column in enumerate(new_columns)}
             if not any(obj.values()):
                 continue
+                
             modified += 1
             table.update(
                 **{new_column.name: values[i + 1] for i, new_column in enumerate(new_columns)}
             ).where(table._meta.primary_key == values[0]).execute()
+            
     txn.commit()
-    print('DONE, %s scanned %s written' % (idx, modified))
+    print(f'DONE, {idx} scanned {modified} written')
+
 @Migrate.only_if(Migrate.missing, Message, 'mentions_new')
 def add_guild_columns(m):
     m.add_columns(
@@ -36,6 +42,7 @@ def add_guild_columns(m):
         Message.attachments_new,
         Message.embeds,
     )
+
 @Migrate.always()
 def backfill_data(m):
     backfill_column(
