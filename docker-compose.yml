@@ -1,18 +1,25 @@
-version: '3'
+version: '3.8'
 services:
   db:
     build: ./docker/database/
     environment:
       - POSTGRES_DB=sentry
       - POSTGRES_USER=sentry
+      - POSTGRES_HOST_AUTH_METHOD=trust
     volumes:
-      - ./.data:/var/lib/postgresql/data
+      - ./.data/postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U sentry"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s # This gives Postgres 30 seconds to boot before counting failures
     restart: always
   redis:
-    image: redis:3.2
+    image: redis:3.2-alpine
     command: redis-server --appendonly yes
     volumes:
-      - ./.data:/data
+      - ./.data/redis:/data
     ports:
       - "6379:6379"
     restart: always
@@ -24,8 +31,10 @@ services:
     ports:
       - "8686:8686"
     depends_on:
-      - db
-      - redis
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_started
     restart: always
   frontend:
     build: ./frontend/
@@ -49,7 +58,10 @@ services:
     ports:
       - "7171:7171"
     depends_on:
-      - web
+      db:
+        condition: service_healthy
+      web:
+        condition: service_started
     restart: always
   workers:
     build: .
@@ -57,5 +69,8 @@ services:
     volumes:
       - .:/opt/sentry
     depends_on:
-      - web
+      db:
+        condition: service_healthy
+      web:
+        condition: service_started
     restart: on-failure
